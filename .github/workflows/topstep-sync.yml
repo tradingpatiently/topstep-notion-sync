@@ -86,9 +86,45 @@ jobs:
               trades = raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} TRADES')
 
-          # DEBUG - print all fields for each trade so we can see what TopStep returns
+          # 4. SYNC TO NOTION - only closed fills (profitAndLoss is not None)
+          synced = 0
           for t in trades:
-              log(f'TRADE RAW DATA: {t}')
+              trade_id = t.get('id', 'unknown')
+              pnl = t.get('profitAndLoss')
+              if pnl is None:
+                  log(f'SKIPPING TRADE {trade_id} - entry fill, no P&L')
+                  continue
 
-          log('FINISHED')
+              trade_date = t.get('creationTimestamp')
+              if not trade_date:
+                  log(f'SKIPPING TRADE {trade_id} - no date')
+                  continue
+
+              symbol = t.get('contractId', 'N/A')
+              fees = t.get('fees', 0) or 0
+              net_pnl = round(pnl - fees, 2)
+
+              log(f'SENDING TRADE {trade_id} | {symbol} | P&L: ${pnl} | Fees: ${fees} | Net: ${net_pnl}')
+              notion_headers = {
+                  'Authorization': f'Bearer {os.environ.get("NOTION_TOKEN")}',
+                  'Notion-Version': '2022-06-28',
+                  'Content-Type': 'application/json'
+              }
+              payload = {
+                  'parent': {'database_id': os.environ.get('NOTION_DATABASE_ID')},
+                  'properties': {
+                      'Symbol': {'title': [{'text': {'content': f'{symbol} | ${net_pnl}'}}]},
+                      'Trade ID': {'rich_text': [{'text': {'content': str(trade_id)}}]},
+                      'P&L': {'number': float(net_pnl)},
+                      'Exit Time': {'date': {'start': trade_date}}
+                  }
+              }
+              n_res = requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
+              if n_res.status_code not in (200, 201):
+                  log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
+              else:
+                  log(f'TRADE {trade_id} SYNCED OK')
+                  synced += 1
+
+          log(f'FINISHED - {synced} trades synced to Notion')
           EOF
