@@ -1,6 +1,8 @@
 name: Real-Time Trade Sync
 on:
   workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * 1-5'
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -22,9 +24,40 @@ jobs:
         run: |
           python - <<'EOF'
           import os, requests, sys
-          from datetime import datetime
+          from datetime import datetime, timezone, timedelta
 
           def log(m): print(f'--- {m}', flush=True)
+
+          # CHECK TRADING HOURS IN EST (handles daylight saving automatically)
+          def get_est_offset():
+              # DST in US: second Sunday in March to first Sunday in November
+              now_utc = datetime.now(timezone.utc)
+              year = now_utc.year
+              # Second Sunday in March
+              march = datetime(year, 3, 1, tzinfo=timezone.utc)
+              dst_start = march + timedelta(days=(6 - march.weekday()) % 7 + 7)
+              # First Sunday in November
+              nov = datetime(year, 11, 1, tzinfo=timezone.utc)
+              dst_end = nov + timedelta(days=(6 - nov.weekday()) % 7)
+              if dst_start <= now_utc.replace(tzinfo=timezone.utc) < dst_end:
+                  return -4  # EDT
+              return -5  # EST
+
+          now_utc = datetime.now(timezone.utc)
+          est_offset = get_est_offset()
+          now_est = now_utc + timedelta(hours=est_offset)
+          est_hour = now_est.hour
+          est_minute = now_est.minute
+          est_time_mins = est_hour * 60 + est_minute
+
+          market_open = 9 * 60 + 30   # 9:30 AM
+          market_close = 16 * 60       # 4:00 PM
+
+          if not (market_open <= est_time_mins < market_close):
+              log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
+              sys.exit(0)
+
+          log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
 
           BASE = 'https://api.topstepx.com/api'
           NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
@@ -71,12 +104,45 @@ jobs:
           account_id = accounts[0].get('id')
           log(f'USING ACCOUNT ID: {account_id}')
 
-          # 3. FETCH TRADES
+          # 3. FETCH EXISTING TRADE IDs FROM NOTION (duplicate prevention)
+          log('FETCHING EXISTING NOTION TRADE IDs')
+          existing_trade_ids = set()
+          notion_headers = {
+              'Authorization': f'Bearer {NOTION_TOKEN}',
+              'Notion-Version': '2022-06-28',
+              'Content-Type': 'application/json'
+          }
+          has_more = True
+          next_cursor = None
+          while has_more:
+              body = {'page_size': 100}
+              if next_cursor:
+                  body['start_cursor'] = next_cursor
+              q_res = requests.post(
+                  f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query',
+                  headers=notion_headers,
+                  json=body
+              )
+              if q_res.status_code != 200:
+                  log(f'NOTION QUERY FAILED: {q_res.status_code} - {q_res.text}')
+                  sys.exit(1)
+              q_data = q_res.json()
+              for page in q_data.get('results', []):
+                  tid = page.get('properties', {}).get('Trade ID', {}).get('rich_text', [])
+                  if tid:
+                      existing_trade_ids.add(tid[0]['text']['content'])
+              has_more = q_data.get('has_more', False)
+              next_cursor = q_data.get('next_cursor')
+
+          log(f'FOUND {len(existing_trade_ids)} EXISTING TRADES IN NOTION')
+
+          # 4. FETCH TRADES FROM TOPSTEP (last 24 hours)
           log('FETCHING TRADES')
+          start_time = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
           t_res = requests.post(
               f'{BASE}/Trade/search',
               headers=auth_headers,
-              json={'accountId': account_id, 'startTime': '2026-03-30T00:00:00Z'}
+              json={'accountId': account_id, 'startTime': start_time}
           )
           if t_res.status_code != 200:
               log(f'FETCH FAILED: {t_res.status_code} - {t_res.text}')
@@ -89,7 +155,7 @@ jobs:
               trades = raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} FILLS')
 
-          # 4. PAIR ENTRY + EXIT FILLS
+          # 5. PAIR ENTRY + EXIT FILLS
           def parse_ts(ts):
               try:
                   return datetime.fromisoformat(ts.replace('Z', '+00:00'))
@@ -128,16 +194,17 @@ jobs:
 
           log(f'PAIRED {len(paired_trades)} TRADES')
 
-          # 5. SYNC TO NOTION
-          notion_headers = {
-              'Authorization': f'Bearer {NOTION_TOKEN}',
-              'Notion-Version': '2022-06-28',
-              'Content-Type': 'application/json'
-          }
-
+          # 6. SYNC NEW TRADES TO NOTION
           synced = 0
+          skipped = 0
           for entry_fill, exit_fill in paired_trades:
-              trade_id = exit_fill.get('id', 'unknown')
+              trade_id = str(exit_fill.get('id', 'unknown'))
+
+              if trade_id in existing_trade_ids:
+                  log(f'SKIPPING {trade_id} - already in Notion')
+                  skipped += 1
+                  continue
+
               pnl = float(exit_fill.get('profitAndLoss', 0))
               fees = float(exit_fill.get('fees', 0) or 0)
               if entry_fill:
@@ -161,7 +228,7 @@ jobs:
 
               properties = {
                   'Note': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
-                  'Trade ID': {'rich_text': [{'text': {'content': str(trade_id)}}]},
+                  'Trade ID': {'rich_text': [{'text': {'content': trade_id}}]},
                   'Direction': {'select': {'name': direction}},
                   'Entry Price': {'number': entry_price},
                   'Exit Price': {'number': exit_price},
@@ -186,5 +253,5 @@ jobs:
                   log(f'TRADE {trade_id} SYNCED OK')
                   synced += 1
 
-          log(f'FINISHED - {synced} trades synced to Notion')
+          log(f'FINISHED - {synced} new trades synced, {skipped} already existed')
           EOF
