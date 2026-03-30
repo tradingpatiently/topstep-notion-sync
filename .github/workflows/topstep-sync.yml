@@ -90,26 +90,20 @@ jobs:
           log(f'FOUND {len(trades)} FILLS')
 
           # 4. PAIR ENTRY + EXIT FILLS
-          # Entry fill = profitAndLoss is None
-          # Exit fill = profitAndLoss is not None
-          entries = {t['id']: t for t in trades if t.get('profitAndLoss') is None}
-          exits = [t for t in trades if t.get('profitAndLoss') is not None]
-
-          # Match each exit fill to the nearest entry fill by timestamp on same contract
           def parse_ts(ts):
               try:
                   return datetime.fromisoformat(ts.replace('Z', '+00:00'))
               except:
                   return None
 
-          paired_trades = []
+          exits = [t for t in trades if t.get('profitAndLoss') is not None]
           used_entry_ids = set()
+          paired_trades = []
 
           for exit_fill in exits:
               contract = exit_fill.get('contractId')
               exit_ts = parse_ts(exit_fill.get('creationTimestamp', ''))
 
-              # Find closest unmatched entry fill on same contract before exit
               best_entry = None
               best_diff = None
               for entry_fill in trades:
@@ -156,23 +150,20 @@ jobs:
 
               exit_price = float(exit_fill.get('price', 0) or 0)
               exit_time = exit_fill.get('creationTimestamp')
-
-              entry_price = float(entry_fill.get('price', 0) or 0) if entry_fill else None
+              entry_price = float(entry_fill.get('price', 0) or 0) if entry_fill else 0
               entry_time = entry_fill.get('creationTimestamp') if entry_fill else None
 
-              # Direction based on entry side: 0=buy(Long), 1=sell(Short)
               side = entry_fill.get('side') if entry_fill else exit_fill.get('side')
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
+              net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              outcome = 'Win' if float(pnl) > 0 else 'Loss' if float(pnl) < 0 else 'Breakeven'
-
-              log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: ${net_pnl} | {outcome}')
+              log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display}')
 
               properties = {
-                  'Session': {'title': [{'text': {'content': f'{asset} {direction} | ${net_pnl}'}}]},
+                  'Name': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
                   'Trade ID': {'rich_text': [{'text': {'content': str(trade_id)}}]},
                   'Direction': {'select': {'name': direction}},
-                  'Entry Price': {'number': entry_price if entry_price else 0},
+                  'Entry Price': {'number': entry_price},
                   'Exit Price': {'number': exit_price},
                   'Exit Time': {'date': {'start': exit_time}},
                   'P&L': {'number': net_pnl},
