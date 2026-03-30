@@ -43,7 +43,7 @@ jobs:
 
           # 2. GET ACCOUNT ID
           log('FETCHING ACCOUNT ID')
-          acc_res = requests.get(
+          acc_res = requests.post(
               'https://api.thefuturesdesk.projectx.com/api/Account/search',
               headers={'Authorization': f'Bearer {token}'},
               json={'onlyActiveAccounts': True}
