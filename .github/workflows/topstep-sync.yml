@@ -31,7 +31,7 @@ jobs:
           k = os.environ.get('PROJECTX_API_KEY')
 
           res = requests.post(
-              'https://gateway.topstepx.com/api/Auth/loginKey',
+              'https://api.topstepx.com/api/Auth/loginKey',
               json={'userName': u, 'apiKey': k}
           )
           if res.status_code != 200:
@@ -44,7 +44,7 @@ jobs:
           # 2. FETCH TRADES
           log('FETCHING TRADES')
           t_res = requests.post(
-              'https://gateway.topstepx.com/api/Trade/search',
+              'https://api.topstepx.com/api/Trade/search',
               headers={'Authorization': f'Bearer {token}'},
               json={'startTime': '2026-03-30T00:00:00Z'}
           )
