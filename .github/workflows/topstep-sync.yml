@@ -22,7 +22,6 @@ jobs:
         run: |
           python - <<'EOF'
           import os, requests, sys
-          from datetime import datetime
 
           def log(m): print(f'--- {m}', flush=True)
 
@@ -89,62 +88,10 @@ jobs:
               trades = raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} TRADES')
 
-          # 4. SYNC TO NOTION - only closed fills (profitAndLoss is not None)
-          notion_headers = {
-              'Authorization': f'Bearer {NOTION_TOKEN}',
-              'Notion-Version': '2022-06-28',
-              'Content-Type': 'application/json'
-          }
-
-          synced = 0
+          # DEBUG - log all fields for every fill so we can see entry vs exit data
+          log('--- ALL FILL DATA ---')
           for t in trades:
-              trade_id = t.get('id', 'unknown')
-              pnl = t.get('profitAndLoss')
-              if pnl is None:
-                  log(f'SKIPPING TRADE {trade_id} - entry fill, no P&L')
-                  continue
+              log(f'FILL: {t}')
 
-              trade_date = t.get('creationTimestamp')
-              if not trade_date:
-                  log(f'SKIPPING TRADE {trade_id} - no date')
-                  continue
-
-              # Parse asset from contractId e.g. CON.F.US.MNQ.M26 -> MNQ
-              contract_id = t.get('contractId', '')
-              parts = contract_id.split('.')
-              asset = parts[3] if len(parts) >= 4 else contract_id
-
-              fees = float(t.get('fees', 0) or 0)
-              net_pnl = round(float(pnl) - fees, 2)
-              size = t.get('size', 1)
-              side = t.get('side')
-              direction = 'Long' if side == 0 else 'Short' if side == 1 else 'Unknown'
-              entry_price = float(t.get('price', 0) or 0)
-
-              log(f'SENDING TRADE {trade_id} | {asset} | {direction} | P&L: ${net_pnl}')
-
-              properties = {
-                  'Session': {'title': [{'text': {'content': f'{asset} {direction} | ${net_pnl}'}}]},
-                  'Trade ID': {'rich_text': [{'text': {'content': str(trade_id)}}]},
-                  'Direction': {'select': {'name': direction}},
-                  'Entry Price': {'number': entry_price},
-                  'Exit Time': {'date': {'start': trade_date}},
-                  'P&L': {'number': net_pnl},
-                  'Commissions': {'number': fees},
-                  'Contract Size': {'number': float(size)},
-              }
-
-              payload = {
-                  'parent': {'database_id': NOTION_DATABASE_ID},
-                  'properties': properties
-              }
-
-              n_res = requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
-              if n_res.status_code not in (200, 201):
-                  log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
-              else:
-                  log(f'TRADE {trade_id} SYNCED OK')
-                  synced += 1
-
-          log(f'FINISHED - {synced} trades synced to Notion')
+          log('FINISHED')
           EOF
