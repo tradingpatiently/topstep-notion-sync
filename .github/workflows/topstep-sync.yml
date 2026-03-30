@@ -31,7 +31,7 @@ jobs:
           k = os.environ.get('PROJECTX_API_KEY')
 
           res = requests.post(
-              'https://api.topstepx.com/api/Auth/loginKey',
+              'https://api.thefuturesdesk.projectx.com/api/Auth/loginKey',
               json={'userName': u, 'apiKey': k}
           )
           if res.status_code != 200:
@@ -41,12 +41,32 @@ jobs:
           token = res.json().get('token')
           log('AUTH SUCCESS')
 
-          # 2. FETCH TRADES
+          # 2. GET ACCOUNT ID
+          log('FETCHING ACCOUNT ID')
+          acc_res = requests.get(
+              'https://api.thefuturesdesk.projectx.com/api/Account/search',
+              headers={'Authorization': f'Bearer {token}'},
+              json={'onlyActiveAccounts': True}
+          )
+          if acc_res.status_code != 200:
+              log(f'ACCOUNT FETCH FAILED: {acc_res.status_code} - {acc_res.text}')
+              sys.exit(1)
+
+          acc_raw = acc_res.json()
+          accounts = acc_raw if isinstance(acc_raw, list) else acc_raw.get('accounts') or acc_raw.get('data') or []
+          if not accounts:
+              log('NO ACCOUNTS FOUND')
+              sys.exit(1)
+
+          account_id = accounts[0].get('id')
+          log(f'USING ACCOUNT ID: {account_id}')
+
+          # 3. FETCH TRADES
           log('FETCHING TRADES')
           t_res = requests.post(
-              'https://api.topstepx.com/api/Trade/search',
+              'https://api.thefuturesdesk.projectx.com/api/Trade/search',
               headers={'Authorization': f'Bearer {token}'},
-              json={'startTime': '2026-03-30T00:00:00Z'}
+              json={'accountId': account_id, 'startTime': '2026-03-30T00:00:00Z'}
           )
           if t_res.status_code != 200:
               log(f'FETCH FAILED: {t_res.status_code} - {t_res.text}')
@@ -59,7 +79,7 @@ jobs:
               trades = raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} TRADES')
 
-          # 3. SYNC TO NOTION
+          # 4. SYNC TO NOTION
           for t in trades:
               trade_id = t.get('id', 'unknown')
               exit_time = t.get('exitTime')
