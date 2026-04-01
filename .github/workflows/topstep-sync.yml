@@ -162,31 +162,32 @@ jobs:
 
           # 6. HELPER: FETCH 1-MINUTE BARS
           def fetch_bars(contract_id, start, end):
-              # Pad window by 1 minute each side to catch bars near entry/exit
               padded_start = start - timedelta(minutes=1)
               padded_end = end + timedelta(minutes=1)
               start_str = padded_start.strftime('%Y-%m-%dT%H:%M:%SZ')
               end_str = padded_end.strftime('%Y-%m-%dT%H:%M:%SZ')
               log(f'FETCHING BARS: {contract_id} from {start_str} to {end_str}')
-              r = requests.post(
-                  f'{BASE}/History/retrieveBars',
-                  headers=auth_headers,
-                  json={
-                      'contractId': contract_id,
-                      'live': True,
-                      'startTime': start_str,
-                      'endTime': end_str,
-                      'unit': 2,
-                      'unitNumber': 1,
-                      'limit': 500,
-                      'includePartialBar': True
-                  }
-              )
-              if r.status_code == 200:
-                  bars = r.json().get('bars') or []
-                  log(f'GOT {len(bars)} BARS')
-                  return bars
-              log(f'BARS FETCH FAILED: {r.status_code} - {r.text[:200]}')
+              for live in [False, True]:
+                  r = requests.post(
+                      f'{BASE}/History/retrieveBars',
+                      headers=auth_headers,
+                      json={
+                          'contractId': contract_id,
+                          'live': live,
+                          'startTime': start_str,
+                          'endTime': end_str,
+                          'unit': 2,
+                          'unitNumber': 1,
+                          'limit': 500,
+                          'includePartialBar': True
+                      }
+                  )
+                  if r.status_code == 200:
+                      bars = r.json().get('bars') or []
+                      if bars:
+                          log(f'GOT {len(bars)} BARS (live={live})')
+                          return bars
+                  log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
               return []
 
           # 7. SYNC
@@ -220,11 +221,16 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # 4PM EST = 20:00 UTC during EDT, 21:00 UTC during EST
+              # DURATION in minutes
+              duration_mins = None
+              if entry_ts and exit_ts:
+                  duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
+                  log(f'DURATION: {duration_mins} minutes')
+
               close_hour_utc = 20 if est_offset == -4 else 21
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
-              # MAE/MFE during trade - use entry/exit prices directly if trade too fast for bars
+              # MAE/MFE during trade
               mae, mfe = None, None
               if entry_ts and exit_ts:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
@@ -235,17 +241,11 @@ jobs:
                       else:
                           mae = round(max(b['h'] for b in bars) - entry_price, 2)
                           mfe = round(entry_price - min(b['l'] for b in bars), 2)
+                      mae = max(mae, 0)
+                      mfe = max(mfe, 0)
                       log(f'MAE: {mae} | MFE: {mfe}')
                   else:
-                      # Trade too fast for bars - use entry/exit price difference
-                      price_diff = round(abs(exit_price - entry_price), 2)
-                      if direction == 'Long':
-                          mae = round(max(entry_price - exit_price, 0), 2)
-                          mfe = round(max(exit_price - entry_price, 0), 2)
-                      else:
-                          mae = round(max(exit_price - entry_price, 0), 2)
-                          mfe = round(max(entry_price - exit_price, 0), 2)
-                      log(f'FAST TRADE - using price diff. MAE: {mae} | MFE: {mfe}')
+                      log('NO BARS AVAILABLE - MAE/MFE left empty')
 
               # Post-exit MAE/MFE until 4PM
               post_mae, post_mfe = None, None
@@ -258,11 +258,15 @@ jobs:
                       else:
                           post_mae = round(max(b['h'] for b in post_bars) - exit_price, 2)
                           post_mfe = round(exit_price - min(b['l'] for b in post_bars), 2)
+                      post_mae = max(post_mae, 0)
+                      post_mfe = max(post_mfe, 0)
                       log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
+                  else:
+                      log('NO POST-EXIT BARS AVAILABLE')
               else:
-                  log(f'NO POST-EXIT WINDOW - exit at {exit_ts}, close at {close_time}')
+                  log('NO POST-EXIT WINDOW')
 
-              log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display}')
+              log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
 
               properties = {
                   'Note': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
@@ -277,6 +281,8 @@ jobs:
               }
               if entry_time:
                   properties['Entry Time'] = {'date': {'start': entry_time}}
+              if duration_mins is not None:
+                  properties['Duration'] = {'number': duration_mins}
               if mae is not None:
                   properties['MAE'] = {'number': mae}
               if mfe is not None:
