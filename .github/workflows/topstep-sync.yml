@@ -3,6 +3,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: '*/5 13-21 * * 1-5'
+    - cron: '0 20 * * 1-5'
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -45,12 +46,19 @@ jobs:
           est_time_mins = now_est.hour * 60 + now_est.minute
           market_open = 9 * 60 + 30
           market_close = 16 * 60
+          eod_window = 16 * 60 + 10  # Allow up to 4:10 PM for the 4PM EOD run
 
-          if not (market_open <= est_time_mins < market_close):
+          is_eod_run = market_close <= est_time_mins <= eod_window
+          is_trading_hours = market_open <= est_time_mins < market_close
+
+          if not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
               sys.exit(0)
 
-          log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
+          if is_eod_run:
+              log(f'EOD RUN ({now_est.strftime("%I:%M %p")} EST) - finalizing Post-Exit MAE/MFE')
+          else:
+              log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
 
           BASE = 'https://api.topstepx.com/api'
           NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
@@ -87,14 +95,15 @@ jobs:
           account_id = accounts[0].get('id')
           log(f'USING ACCOUNT ID: {account_id}')
 
-          # 3. FETCH EXISTING TRADE IDs FROM NOTION
-          log('FETCHING EXISTING NOTION TRADE IDs')
-          existing_trade_ids = set()
           notion_headers = {
               'Authorization': f'Bearer {NOTION_TOKEN}',
               'Notion-Version': '2022-06-28',
               'Content-Type': 'application/json'
           }
+
+          # 3. FETCH EXISTING TRADES FROM NOTION (id + page_id)
+          log('FETCHING EXISTING NOTION TRADES')
+          existing_trades = {}  # trade_id -> page_id
           has_more = True
           next_cursor = None
           while has_more:
@@ -109,14 +118,14 @@ jobs:
               for page in q_data.get('results', []):
                   tid = page.get('properties', {}).get('Trade ID', {}).get('rich_text', [])
                   if tid:
-                      existing_trade_ids.add(tid[0]['text']['content'])
+                      existing_trades[tid[0]['text']['content']] = page['id']
               has_more = q_data.get('has_more', False)
               next_cursor = q_data.get('next_cursor')
-          log(f'FOUND {len(existing_trade_ids)} EXISTING TRADES IN NOTION')
+          log(f'FOUND {len(existing_trades)} EXISTING TRADES IN NOTION')
 
-          # 4. FETCH TRADES
+          # 4. FETCH TRADES FROM TOPSTEP
           log('FETCHING TRADES')
-          start_time = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+          start_time = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
           t_res = requests.post(f'{BASE}/Trade/search', headers=auth_headers, json={'accountId': account_id, 'startTime': start_time})
           if t_res.status_code != 200:
               log(f'FETCH FAILED: {t_res.status_code} - {t_res.text}')
@@ -190,15 +199,15 @@ jobs:
                   log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
               return []
 
-          # 7. SYNC
+          # 7. PROCESS TRADES
+          close_hour_utc = 20 if est_offset == -4 else 21
           synced = 0
+          updated = 0
           skipped = 0
+
           for entry_fill, exit_fill in paired_trades:
               trade_id = str(exit_fill.get('id', 'unknown'))
-              if trade_id in existing_trade_ids:
-                  log(f'SKIPPING {trade_id} - already in Notion')
-                  skipped += 1
-                  continue
+              already_exists = trade_id in existing_trades
 
               pnl = float(exit_fill.get('profitAndLoss', 0))
               fees = float(exit_fill.get('fees', 0) or 0)
@@ -221,14 +230,54 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # DURATION in minutes
+              close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
+
+              # EOD RUN - only update post-exit data on existing trades
+              if is_eod_run:
+                  if not already_exists:
+                      log(f'EOD: SKIPPING {trade_id} - not in Notion yet')
+                      continue
+                  log(f'EOD: UPDATING post-exit for {trade_id}')
+                  post_mae, post_mfe = None, None
+                  if exit_ts and close_time and exit_ts < close_time:
+                      post_bars = fetch_bars(contract_id, exit_ts, close_time)
+                      if post_bars:
+                          if direction == 'Long':
+                              post_mae = max(round(exit_price - min(b['l'] for b in post_bars), 2), 0)
+                              post_mfe = max(round(max(b['h'] for b in post_bars) - exit_price, 2), 0)
+                          else:
+                              post_mae = max(round(max(b['h'] for b in post_bars) - exit_price, 2), 0)
+                              post_mfe = max(round(exit_price - min(b['l'] for b in post_bars), 2), 0)
+                          log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
+
+                  if post_mae is not None and post_mfe is not None:
+                      page_id = existing_trades[trade_id]
+                      update_res = requests.patch(
+                          f'https://api.notion.com/v1/pages/{page_id}',
+                          headers=notion_headers,
+                          json={'properties': {
+                              'Post-Exit MAE': {'number': post_mae},
+                              'Post-Exit MFE': {'number': post_mfe}
+                          }}
+                      )
+                      if update_res.status_code == 200:
+                          log(f'TRADE {trade_id} POST-EXIT UPDATED OK')
+                          updated += 1
+                      else:
+                          log(f'UPDATE FAILED for {trade_id}: {update_res.status_code} - {update_res.text}')
+                  continue
+
+              # REGULAR RUN - skip existing, create new
+              if already_exists:
+                  log(f'SKIPPING {trade_id} - already in Notion')
+                  skipped += 1
+                  continue
+
+              # Duration
               duration_mins = None
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
                   log(f'DURATION: {duration_mins} minutes')
-
-              close_hour_utc = 20 if est_offset == -4 else 21
-              close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
               # MAE/MFE during trade
               mae, mfe = None, None
@@ -236,35 +285,14 @@ jobs:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
                   if bars:
                       if direction == 'Long':
-                          mae = round(entry_price - min(b['l'] for b in bars), 2)
-                          mfe = round(max(b['h'] for b in bars) - entry_price, 2)
+                          mae = max(round(entry_price - min(b['l'] for b in bars), 2), 0)
+                          mfe = max(round(max(b['h'] for b in bars) - entry_price, 2), 0)
                       else:
-                          mae = round(max(b['h'] for b in bars) - entry_price, 2)
-                          mfe = round(entry_price - min(b['l'] for b in bars), 2)
-                      mae = max(mae, 0)
-                      mfe = max(mfe, 0)
+                          mae = max(round(max(b['h'] for b in bars) - entry_price, 2), 0)
+                          mfe = max(round(entry_price - min(b['l'] for b in bars), 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
-
-              # Post-exit MAE/MFE until 4PM
-              post_mae, post_mfe = None, None
-              if exit_ts and close_time and exit_ts < close_time:
-                  post_bars = fetch_bars(contract_id, exit_ts, close_time)
-                  if post_bars:
-                      if direction == 'Long':
-                          post_mae = round(exit_price - min(b['l'] for b in post_bars), 2)
-                          post_mfe = round(max(b['h'] for b in post_bars) - exit_price, 2)
-                      else:
-                          post_mae = round(max(b['h'] for b in post_bars) - exit_price, 2)
-                          post_mfe = round(exit_price - min(b['l'] for b in post_bars), 2)
-                      post_mae = max(post_mae, 0)
-                      post_mfe = max(post_mfe, 0)
-                      log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
-                  else:
-                      log('NO POST-EXIT BARS AVAILABLE')
-              else:
-                  log('NO POST-EXIT WINDOW')
 
               log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
 
@@ -287,10 +315,6 @@ jobs:
                   properties['MAE'] = {'number': mae}
               if mfe is not None:
                   properties['MFE'] = {'number': mfe}
-              if post_mae is not None:
-                  properties['Post-Exit MAE'] = {'number': post_mae}
-              if post_mfe is not None:
-                  properties['Post-Exit MFE'] = {'number': post_mfe}
 
               payload = {
                   'parent': {'database_id': NOTION_DATABASE_ID},
@@ -303,5 +327,8 @@ jobs:
                   log(f'TRADE {trade_id} SYNCED OK')
                   synced += 1
 
-          log(f'FINISHED - {synced} new trades synced, {skipped} already existed')
+          if is_eod_run:
+              log(f'FINISHED EOD - {updated} trades updated with Post-Exit data')
+          else:
+              log(f'FINISHED - {synced} new trades synced, {skipped} already existed')
           EOF
