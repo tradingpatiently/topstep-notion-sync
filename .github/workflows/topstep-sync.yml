@@ -160,10 +160,13 @@ jobs:
                   paired_trades.append((None, exit_fill))
           log(f'PAIRED {len(paired_trades)} TRADES')
 
-          # 6. HELPER: FETCH 1-MINUTE BARS WITH FULL DEBUG
+          # 6. HELPER: FETCH 1-MINUTE BARS
           def fetch_bars(contract_id, start, end):
-              start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
-              end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
+              # Pad window by 1 minute each side to catch bars near entry/exit
+              padded_start = start - timedelta(minutes=1)
+              padded_end = end + timedelta(minutes=1)
+              start_str = padded_start.strftime('%Y-%m-%dT%H:%M:%SZ')
+              end_str = padded_end.strftime('%Y-%m-%dT%H:%M:%SZ')
               log(f'FETCHING BARS: {contract_id} from {start_str} to {end_str}')
               r = requests.post(
                   f'{BASE}/History/retrieveBars',
@@ -176,14 +179,14 @@ jobs:
                       'unit': 2,
                       'unitNumber': 1,
                       'limit': 500,
-                      'includePartialBar': False
+                      'includePartialBar': True
                   }
               )
-              log(f'BARS RESPONSE: {r.status_code} - {r.text[:300]}')
               if r.status_code == 200:
-                  bars = r.json().get('bars', [])
+                  bars = r.json().get('bars') or []
                   log(f'GOT {len(bars)} BARS')
                   return bars
+              log(f'BARS FETCH FAILED: {r.status_code} - {r.text[:200]}')
               return []
 
           # 7. SYNC
@@ -217,12 +220,13 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # 4PM EST close time in UTC
-              close_time = exit_ts.replace(hour=20 + abs(est_offset) - 5, minute=0, second=0, microsecond=0) if exit_ts else None
+              # 4PM EST = 20:00 UTC during EDT, 21:00 UTC during EST
+              close_hour_utc = 20 if est_offset == -4 else 21
+              close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
-              # MAE/MFE during trade
+              # MAE/MFE during trade - use entry/exit prices directly if trade too fast for bars
               mae, mfe = None, None
-              if entry_ts and exit_ts and entry_ts < exit_ts:
+              if entry_ts and exit_ts:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
                   if bars:
                       if direction == 'Long':
@@ -232,8 +236,16 @@ jobs:
                           mae = round(max(b['h'] for b in bars) - entry_price, 2)
                           mfe = round(entry_price - min(b['l'] for b in bars), 2)
                       log(f'MAE: {mae} | MFE: {mfe}')
-              else:
-                  log(f'SKIPPING MAE/MFE - entry_ts: {entry_ts} exit_ts: {exit_ts}')
+                  else:
+                      # Trade too fast for bars - use entry/exit price difference
+                      price_diff = round(abs(exit_price - entry_price), 2)
+                      if direction == 'Long':
+                          mae = round(max(entry_price - exit_price, 0), 2)
+                          mfe = round(max(exit_price - entry_price, 0), 2)
+                      else:
+                          mae = round(max(exit_price - entry_price, 0), 2)
+                          mfe = round(max(entry_price - exit_price, 0), 2)
+                      log(f'FAST TRADE - using price diff. MAE: {mae} | MFE: {mfe}')
 
               # Post-exit MAE/MFE until 4PM
               post_mae, post_mfe = None, None
@@ -248,7 +260,7 @@ jobs:
                           post_mfe = round(exit_price - min(b['l'] for b in post_bars), 2)
                       log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
               else:
-                  log(f'SKIPPING POST-EXIT - exit_ts: {exit_ts} close_time: {close_time}')
+                  log(f'NO POST-EXIT WINDOW - exit at {exit_ts}, close at {close_time}')
 
               log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display}')
 
