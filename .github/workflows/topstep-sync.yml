@@ -2,8 +2,8 @@ name: Real-Time Trade Sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 13-21 * * 1-5'
-    - cron: '0 20 * * 1-5'
+    - cron: '*/5 13-20 * * 1-5'
+    - cron: '0 20,21 * * 1-5'
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -46,10 +46,9 @@ jobs:
           est_time_mins = now_est.hour * 60 + now_est.minute
           market_open = 9 * 60 + 30
           market_close = 16 * 60
-          eod_window = 16 * 60 + 10  # Allow up to 4:10 PM for the 4PM EOD run
 
-          is_eod_run = market_close <= est_time_mins <= eod_window
           is_trading_hours = market_open <= est_time_mins < market_close
+          is_eod_run = market_close <= est_time_mins <= (market_close + 120)
 
           if not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
@@ -101,9 +100,9 @@ jobs:
               'Content-Type': 'application/json'
           }
 
-          # 3. FETCH EXISTING TRADES FROM NOTION (id + page_id)
+          # 3. FETCH EXISTING TRADES FROM NOTION
           log('FETCHING EXISTING NOTION TRADES')
-          existing_trades = {}  # trade_id -> page_id
+          existing_trades = {}
           has_more = True
           next_cursor = None
           while has_more:
@@ -230,9 +229,10 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
+              # 4PM close time in UTC
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
-              # EOD RUN - only update post-exit data on existing trades
+              # EOD RUN - update post-exit data on existing trades
               if is_eod_run:
                   if not already_exists:
                       log(f'EOD: SKIPPING {trade_id} - not in Notion yet')
@@ -249,6 +249,10 @@ jobs:
                               post_mae = max(round(max(b['h'] for b in post_bars) - exit_price, 2), 0)
                               post_mfe = max(round(exit_price - min(b['l'] for b in post_bars), 2), 0)
                           log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
+                      else:
+                          log(f'NO POST-EXIT BARS AVAILABLE')
+                  else:
+                      log(f'NO POST-EXIT WINDOW for {trade_id}')
 
                   if post_mae is not None and post_mfe is not None:
                       page_id = existing_trades[trade_id]
