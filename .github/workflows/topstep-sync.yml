@@ -2,7 +2,7 @@ name: Real-Time Trade Sync
 on:
   workflow_dispatch:
   schedule:
-    - cron: '*/5 * * * 1-5'
+    - cron: '*/5 13-21 * * 1-5'
 jobs:
   sync:
     runs-on: ubuntu-latest
@@ -195,8 +195,8 @@ jobs:
                       'live': True,
                       'startTime': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
                       'endTime': end.strftime('%Y-%m-%dT%H:%M:%SZ'),
-                      'unit': 2,        # Minute bars
-                      'unitNumber': 1,  # 1-minute
+                      'unit': 2,
+                      'unitNumber': 1,
                       'limit': 500,
                       'includePartialBar': False
                   }
@@ -238,11 +238,9 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # 4PM EST cutoff for post-exit window
-              if exit_ts:
-                  close_time = exit_ts.replace(hour=20, minute=0, second=0, microsecond=0)  # 4PM EST = 20:00 UTC
-                  if exit_ts.hour >= 20:
-                      close_time = exit_ts  # already past 4PM, no post-exit window
+              # 4PM EST cutoff in UTC (accounts for EDT/EST)
+              close_hour_utc = 20 - (est_offset + 5)  # convert 4PM EST to UTC
+              close_time = exit_ts.replace(hour=20, minute=0, second=0, microsecond=0) if exit_ts else None
 
               # CALCULATE MAE/MFE during trade
               mae, mfe = None, None
@@ -250,20 +248,16 @@ jobs:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
                   if bars:
                       if direction == 'Long':
-                          lows = [b['l'] for b in bars]
-                          highs = [b['h'] for b in bars]
-                          mae = round(entry_price - min(lows), 2)   # worst drop below entry
-                          mfe = round(max(highs) - entry_price, 2)  # best rise above entry
+                          mae = round(entry_price - min(b['l'] for b in bars), 2)
+                          mfe = round(max(b['h'] for b in bars) - entry_price, 2)
                       else:
-                          lows = [b['l'] for b in bars]
-                          highs = [b['h'] for b in bars]
-                          mae = round(max(highs) - entry_price, 2)  # worst rise above entry
-                          mfe = round(entry_price - min(lows), 2)   # best drop below entry
+                          mae = round(max(b['h'] for b in bars) - entry_price, 2)
+                          mfe = round(entry_price - min(b['l'] for b in bars), 2)
                       log(f'MAE: {mae} | MFE: {mfe}')
 
               # CALCULATE POST-EXIT MAE/MFE until 4PM
               post_mae, post_mfe = None, None
-              if exit_ts and exit_ts < close_time:
+              if exit_ts and close_time and exit_ts < close_time:
                   post_bars = fetch_bars(contract_id, exit_ts, close_time)
                   if post_bars:
                       if direction == 'Long':
