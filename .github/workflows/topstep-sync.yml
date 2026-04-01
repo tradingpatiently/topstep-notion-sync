@@ -45,8 +45,8 @@ jobs:
           now_est = now_utc + timedelta(hours=est_offset)
           est_time_mins = now_est.hour * 60 + now_est.minute
 
-          market_open = 9 * 60 + 30   # 9:30 AM
-          market_close = 16 * 60       # 4:00 PM
+          market_open = 9 * 60 + 30
+          market_close = 16 * 60
 
           if not (market_open <= est_time_mins < market_close):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
@@ -74,13 +74,14 @@ jobs:
           token = res.json().get('token')
           log('AUTH SUCCESS')
 
-          # 2. GET ACCOUNT ID
-          log('FETCHING ACCOUNT ID')
           auth_headers = {
               'Authorization': f'Bearer {token}',
               'Content-Type': 'application/json',
               'Accept': 'application/json'
           }
+
+          # 2. GET ACCOUNT ID
+          log('FETCHING ACCOUNT ID')
           acc_res = requests.post(
               f'{BASE}/Account/search',
               headers=auth_headers,
@@ -99,7 +100,7 @@ jobs:
           account_id = accounts[0].get('id')
           log(f'USING ACCOUNT ID: {account_id}')
 
-          # 3. FETCH EXISTING TRADE IDs FROM NOTION (duplicate prevention)
+          # 3. FETCH EXISTING TRADE IDs FROM NOTION
           log('FETCHING EXISTING NOTION TRADE IDs')
           existing_trade_ids = set()
           notion_headers = {
@@ -144,10 +145,7 @@ jobs:
               sys.exit(1)
 
           raw = t_res.json()
-          if isinstance(raw, list):
-              trades = raw
-          else:
-              trades = raw.get('trades') or raw.get('data') or raw.get('items') or []
+          trades = raw if isinstance(raw, list) else raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} FILLS')
 
           # 5. PAIR ENTRY + EXIT FILLS
@@ -164,7 +162,6 @@ jobs:
           for exit_fill in exits:
               contract = exit_fill.get('contractId')
               exit_ts = parse_ts(exit_fill.get('creationTimestamp', ''))
-
               best_entry = None
               best_diff = None
               for entry_fill in trades:
@@ -180,7 +177,6 @@ jobs:
                       if best_diff is None or diff < best_diff:
                           best_diff = diff
                           best_entry = entry_fill
-
               if best_entry:
                   used_entry_ids.add(best_entry['id'])
                   paired_trades.append((best_entry, exit_fill))
@@ -189,7 +185,28 @@ jobs:
 
           log(f'PAIRED {len(paired_trades)} TRADES')
 
-          # 6. SYNC NEW TRADES TO NOTION
+          # 6. HELPER: FETCH 1-MINUTE BARS
+          def fetch_bars(contract_id, start, end):
+              r = requests.post(
+                  f'{BASE}/History/retrieveBars',
+                  headers=auth_headers,
+                  json={
+                      'contractId': contract_id,
+                      'live': True,
+                      'startTime': start.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      'endTime': end.strftime('%Y-%m-%dT%H:%M:%SZ'),
+                      'unit': 2,        # Minute bars
+                      'unitNumber': 1,  # 1-minute
+                      'limit': 500,
+                      'includePartialBar': False
+                  }
+              )
+              if r.status_code == 200:
+                  return r.json().get('bars', [])
+              log(f'BARS FETCH FAILED: {r.status_code} - {r.text}')
+              return []
+
+          # 7. SYNC NEW TRADES TO NOTION
           synced = 0
           skipped = 0
           for entry_fill, exit_fill in paired_trades:
@@ -212,12 +229,50 @@ jobs:
 
               exit_price = float(exit_fill.get('price', 0) or 0)
               exit_time = exit_fill.get('creationTimestamp')
+              exit_ts = parse_ts(exit_time)
               entry_price = float(entry_fill.get('price', 0) or 0) if entry_fill else 0
               entry_time = entry_fill.get('creationTimestamp') if entry_fill else None
+              entry_ts = parse_ts(entry_time) if entry_time else None
 
               side = entry_fill.get('side') if entry_fill else exit_fill.get('side')
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
+
+              # 4PM EST cutoff for post-exit window
+              if exit_ts:
+                  close_time = exit_ts.replace(hour=20, minute=0, second=0, microsecond=0)  # 4PM EST = 20:00 UTC
+                  if exit_ts.hour >= 20:
+                      close_time = exit_ts  # already past 4PM, no post-exit window
+
+              # CALCULATE MAE/MFE during trade
+              mae, mfe = None, None
+              if entry_ts and exit_ts and entry_ts < exit_ts:
+                  bars = fetch_bars(contract_id, entry_ts, exit_ts)
+                  if bars:
+                      if direction == 'Long':
+                          lows = [b['l'] for b in bars]
+                          highs = [b['h'] for b in bars]
+                          mae = round(entry_price - min(lows), 2)   # worst drop below entry
+                          mfe = round(max(highs) - entry_price, 2)  # best rise above entry
+                      else:
+                          lows = [b['l'] for b in bars]
+                          highs = [b['h'] for b in bars]
+                          mae = round(max(highs) - entry_price, 2)  # worst rise above entry
+                          mfe = round(entry_price - min(lows), 2)   # best drop below entry
+                      log(f'MAE: {mae} | MFE: {mfe}')
+
+              # CALCULATE POST-EXIT MAE/MFE until 4PM
+              post_mae, post_mfe = None, None
+              if exit_ts and exit_ts < close_time:
+                  post_bars = fetch_bars(contract_id, exit_ts, close_time)
+                  if post_bars:
+                      if direction == 'Long':
+                          post_mae = round(exit_price - min(b['l'] for b in post_bars), 2)
+                          post_mfe = round(max(b['h'] for b in post_bars) - exit_price, 2)
+                      else:
+                          post_mae = round(max(b['h'] for b in post_bars) - exit_price, 2)
+                          post_mfe = round(exit_price - min(b['l'] for b in post_bars), 2)
+                      log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
 
               log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Exit: {exit_price} | P&L: {net_pnl_display}')
 
@@ -235,6 +290,14 @@ jobs:
 
               if entry_time:
                   properties['Entry Time'] = {'date': {'start': entry_time}}
+              if mae is not None:
+                  properties['MAE'] = {'number': mae}
+              if mfe is not None:
+                  properties['MFE'] = {'number': mfe}
+              if post_mae is not None:
+                  properties['Post-Exit MAE'] = {'number': post_mae}
+              if post_mfe is not None:
+                  properties['Post-Exit MFE'] = {'number': post_mfe}
 
               payload = {
                   'parent': {'database_id': NOTION_DATABASE_ID},
