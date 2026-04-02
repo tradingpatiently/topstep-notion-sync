@@ -271,10 +271,9 @@ jobs:
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
 
-              # MAE/MFE using second-level bars for precision
+              # MAE/MFE using second-level bars, fall back to minute bars
               mae, mfe = None, None
               if entry_ts and exit_ts:
-                  # Try second bars first, fall back to minute bars
                   bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=1)
                   if not bars:
                       bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
@@ -283,10 +282,18 @@ jobs:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
                       if direction == 'Short':
-                          mae = max(round(highest - entry_price, 2), 0)
+                          # MAE = how far above entry price went (adverse)
+                          # Cap at avg_exit_price since that's the worst realized price
+                          raw_mae = round(highest - entry_price, 2)
+                          mae = max(min(raw_mae, round(avg_exit_price - entry_price, 2)), 0)
+                          # MFE = how far below entry price went (favorable)
                           mfe = max(round(entry_price - lowest, 2), 0)
                       else:
-                          mae = max(round(entry_price - lowest, 2), 0)
+                          # MAE = how far below entry price went (adverse)
+                          # Cap at avg_exit_price since that's the worst realized price
+                          raw_mae = round(entry_price - lowest, 2)
+                          mae = max(min(raw_mae, round(entry_price - avg_exit_price, 2)), 0)
+                          # MFE = how far above entry price went (favorable)
                           mfe = max(round(highest - entry_price, 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
                   else:
