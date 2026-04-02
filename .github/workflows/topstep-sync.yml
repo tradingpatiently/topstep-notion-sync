@@ -1,6 +1,11 @@
 name: Real-Time Trade Sync
 on:
   workflow_dispatch:
+    inputs:
+      force_eod:
+        description: 'Force EOD run to update Post-Exit data'
+        required: false
+        default: 'false'
   schedule:
     - cron: '*/5 13-20 * * 1-5'
     - cron: '0 20,21 * * 1-5'
@@ -23,6 +28,7 @@ jobs:
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           TRIGGERED_BY: ${{ github.event_name }}
+          FORCE_EOD: ${{ github.event.inputs.force_eod }}
         run: |
           python - <<'EOF'
           import os, requests, sys
@@ -49,21 +55,22 @@ jobs:
           market_close = 16 * 60
 
           is_manual = os.environ.get('TRIGGERED_BY') == 'workflow_dispatch'
+          force_eod = os.environ.get('FORCE_EOD', 'false').lower() == 'true'
           is_trading_hours = market_open <= est_time_mins < market_close
-          is_eod_run = market_close <= est_time_mins <= (market_close + 240)
+          is_eod_run = force_eod or market_close <= est_time_mins <= (market_close + 240)
 
           if not is_manual and not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
               sys.exit(0)
 
-          if is_manual:
-              log(f'MANUAL RUN ({now_est.strftime("%I:%M %p")} EST) - proceeding regardless of time')
+          if force_eod:
+              log(f'FORCED EOD RUN ({now_est.strftime("%I:%M %p")} EST) - updating Post-Exit MAE/MFE')
           elif is_eod_run:
               log(f'EOD RUN ({now_est.strftime("%I:%M %p")} EST) - finalizing Post-Exit MAE/MFE')
+          elif is_manual:
+              log(f'MANUAL RUN ({now_est.strftime("%I:%M %p")} EST) - proceeding regardless of time')
           else:
               log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
-
-          is_eod_run = is_eod_run or (is_manual and est_time_mins >= market_close)
 
           BASE = 'https://api.topstepx.com/api'
           NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
@@ -130,7 +137,7 @@ jobs:
 
           # 4. FETCH TRADES FROM TOPSTEP
           log('FETCHING TRADES')
-          start_time = (datetime.now(timezone.utc) - timedelta(hours=24)).strftime('%Y-%m-%dT%H:%M:%SZ')
+          start_time = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
           t_res = requests.post(f'{BASE}/Trade/search', headers=auth_headers, json={'accountId': account_id, 'startTime': start_time})
           if t_res.status_code != 200:
               log(f'FETCH FAILED: {t_res.status_code} - {t_res.text}')
@@ -264,7 +271,16 @@ jobs:
               side = entry_fill.get('side') if entry_fill else exit_fills_group[0].get('side')
               direction = 'Short' if side == 1 else 'Long' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
-              close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
+
+              # For EOD: use the day's 4PM close time based on the trade's date
+              trade_date = exit_ts.date() if exit_ts else None
+              if trade_date:
+                  close_time = datetime(
+                      trade_date.year, trade_date.month, trade_date.day,
+                      close_hour_utc, 0, 0, tzinfo=timezone.utc
+                  )
+              else:
+                  close_time = None
 
               # Duration
               duration_mins = None
@@ -274,12 +290,9 @@ jobs:
               # MAE/MFE using 30-second bars
               mae, mfe = None, None
               if entry_ts and exit_ts:
-                  # 30-second bars (unit=1 seconds, unitNumber=30)
                   bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=30)
                   if not bars:
-                      # Fall back to 1-minute bars
                       bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
-
                   if bars:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
