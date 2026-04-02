@@ -22,6 +22,7 @@ jobs:
           PROJECTX_API_KEY: ${{ secrets.PROJECTX_API_KEY }}
           NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TRIGGERED_BY: ${{ github.event_name }}
         run: |
           python - <<'EOF'
           import os, requests, sys
@@ -47,17 +48,24 @@ jobs:
           market_open = 9 * 60 + 30
           market_close = 16 * 60
 
+          is_manual = os.environ.get('TRIGGERED_BY') == 'workflow_dispatch'
           is_trading_hours = market_open <= est_time_mins < market_close
           is_eod_run = market_close <= est_time_mins <= (market_close + 240)
 
-          if not (is_trading_hours or is_eod_run):
+          # Manual runs always proceed, scheduled runs check time
+          if not is_manual and not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
               sys.exit(0)
 
-          if is_eod_run:
+          if is_manual:
+              log(f'MANUAL RUN ({now_est.strftime("%I:%M %p")} EST) - proceeding regardless of time')
+          elif is_eod_run:
               log(f'EOD RUN ({now_est.strftime("%I:%M %p")} EST) - finalizing Post-Exit MAE/MFE')
           else:
               log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
+
+          # For EOD logic: treat as EOD if past 4PM (even for manual runs after hours)
+          is_eod_run = is_eod_run or (is_manual and est_time_mins >= market_close)
 
           BASE = 'https://api.topstepx.com/api'
           NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
@@ -141,16 +149,13 @@ jobs:
                   return None
 
           entry_fills = [t for t in trades if t.get('profitAndLoss') is None]
-          exit_fills = [t for t in trades if t.get('profitAndLoss') is not None]
+          exit_fills_all = [t for t in trades if t.get('profitAndLoss') is not None]
 
           # 6. GROUP EXITS INTO COMPLETE TRADES
-          # Strategy: for each entry fill, find all exit fills on same contract
-          # that occur after entry and sum up to match total contract size
           paired_trades = []
           used_exit_ids = set()
           used_entry_ids = set()
 
-          # Sort entries by timestamp
           entry_fills_sorted = sorted(entry_fills, key=lambda x: x.get('creationTimestamp', ''))
 
           for entry_fill in entry_fills_sorted:
@@ -160,9 +165,8 @@ jobs:
               entry_ts = parse_ts(entry_fill.get('creationTimestamp', ''))
               entry_size = entry_fill.get('size', 1)
 
-              # Find all exit fills on same contract after this entry
               matching_exits = []
-              for exit_fill in exit_fills:
+              for exit_fill in exit_fills_all:
                   if exit_fill['id'] in used_exit_ids:
                       continue
                   if exit_fill.get('contractId') != contract:
@@ -171,7 +175,6 @@ jobs:
                   if exit_ts and entry_ts and exit_ts >= entry_ts:
                       matching_exits.append(exit_fill)
 
-              # Sort by timestamp and take fills until size matches entry
               matching_exits.sort(key=lambda x: x.get('creationTimestamp', ''))
               grouped_exits = []
               size_filled = 0
@@ -186,8 +189,7 @@ jobs:
                   used_entry_ids.add(entry_fill['id'])
                   paired_trades.append((entry_fill, grouped_exits))
 
-          # Also handle any exit fills with no matching entry
-          for exit_fill in exit_fills:
+          for exit_fill in exit_fills_all:
               if exit_fill['id'] not in used_exit_ids:
                   paired_trades.append((None, [exit_fill]))
 
@@ -230,12 +232,10 @@ jobs:
           skipped = 0
 
           for entry_fill, exit_fills_group in paired_trades:
-              # Use earliest exit fill ID as the trade ID
               exit_fills_group.sort(key=lambda x: x.get('creationTimestamp', ''))
               trade_id = str(exit_fills_group[0].get('id', 'unknown'))
               already_exists = trade_id in existing_trades
 
-              # Combine P&L and fees across all exit fills
               total_pnl = sum(float(ef.get('profitAndLoss', 0) or 0) for ef in exit_fills_group)
               total_fees = sum(float(ef.get('fees', 0) or 0) for ef in exit_fills_group)
               if entry_fill:
@@ -246,24 +246,20 @@ jobs:
               parts = contract_id.split('.')
               asset = parts[3] if len(parts) >= 4 else contract_id
 
-              # Weighted average exit price
               total_size = sum(ef.get('size', 1) for ef in exit_fills_group)
               avg_exit_price = round(
                   sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in exit_fills_group) / total_size, 2
               )
 
-              # Entry time = entry fill timestamp, exit time = last exit fill timestamp
               entry_time = entry_fill.get('creationTimestamp') if entry_fill else None
               entry_ts = parse_ts(entry_time) if entry_time else None
               entry_price = float(entry_fill.get('price', 0) or 0) if entry_fill else 0
-
               exit_time = exit_fills_group[-1].get('creationTimestamp')
               exit_ts = parse_ts(exit_time)
 
               side = entry_fill.get('side') if entry_fill else exit_fills_group[0].get('side')
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
-
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
               # EOD RUN
@@ -311,13 +307,11 @@ jobs:
                   skipped += 1
                   continue
 
-              # Duration
               duration_mins = None
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
                   log(f'DURATION: {duration_mins} minutes')
 
-              # MAE/MFE during trade
               mae, mfe = None, None
               if entry_ts and exit_ts:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
