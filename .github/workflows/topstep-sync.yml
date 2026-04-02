@@ -48,7 +48,7 @@ jobs:
           market_close = 16 * 60
 
           is_trading_hours = market_open <= est_time_mins < market_close
-          is_eod_run = market_close <= est_time_mins <= (market_close + 120)
+          is_eod_run = market_close <= est_time_mins <= (market_close + 240)
 
           if not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
