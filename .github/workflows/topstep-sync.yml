@@ -194,10 +194,10 @@ jobs:
           log(f'GROUPED {len(paired_trades)} TRADES')
 
           # 7. HELPER: FETCH BARS
-          def fetch_bars(contract_id, start, end, unit=1, unit_number=1):
+          def fetch_bars(contract_id, start, end, unit=1, unit_number=30):
               start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
               end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
-              log(f'FETCHING BARS (unit={unit}): {contract_id} from {start_str} to {end_str}')
+              log(f'FETCHING BARS (unit={unit} x {unit_number}): {contract_id} from {start_str} to {end_str}')
               for live in [False, True]:
                   r = requests.post(
                       f'{BASE}/History/retrieveBars',
@@ -271,35 +271,31 @@ jobs:
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
 
-              # MAE/MFE using second-level bars, fall back to minute bars
+              # MAE/MFE using 30-second bars
               mae, mfe = None, None
               if entry_ts and exit_ts:
-                  bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=1)
+                  # 30-second bars (unit=1 seconds, unitNumber=30)
+                  bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=30)
                   if not bars:
+                      # Fall back to 1-minute bars
                       bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
 
                   if bars:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
                       if direction == 'Short':
-                          # MAE = how far above entry price went (adverse)
-                          # Cap at avg_exit_price since that's the worst realized price
                           raw_mae = round(highest - entry_price, 2)
                           mae = max(min(raw_mae, round(avg_exit_price - entry_price, 2)), 0)
-                          # MFE = how far below entry price went (favorable)
                           mfe = max(round(entry_price - lowest, 2), 0)
                       else:
-                          # MAE = how far below entry price went (adverse)
-                          # Cap at avg_exit_price since that's the worst realized price
                           raw_mae = round(entry_price - lowest, 2)
                           mae = max(min(raw_mae, round(entry_price - avg_exit_price, 2)), 0)
-                          # MFE = how far above entry price went (favorable)
                           mfe = max(round(highest - entry_price, 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
 
-              # Post-exit MAE/MFE using minute bars from exit to 4PM
+              # Post-exit MAE/MFE using 1-minute bars from exit to 4PM
               post_mae, post_mfe = None, None
               if is_eod_run and exit_ts and close_time and exit_ts < close_time:
                   post_bars = fetch_bars(contract_id, exit_ts, close_time, unit=2, unit_number=1)
