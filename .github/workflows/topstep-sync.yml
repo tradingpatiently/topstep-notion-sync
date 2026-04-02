@@ -193,7 +193,7 @@ jobs:
 
           log(f'GROUPED {len(paired_trades)} TRADES')
 
-          # 7. HELPER: FETCH BARS - no padding for trade window, padding only for post-exit
+          # 7. HELPER: FETCH BARS
           def fetch_bars(contract_id, start, end, pad=False):
               if pad:
                   start = start - timedelta(minutes=1)
@@ -264,8 +264,9 @@ jobs:
               exit_time = exit_fills_group[-1].get('creationTimestamp')
               exit_ts = parse_ts(exit_time)
 
+              # FIXED: side 1 = sell to open = Short, side 0 = buy to open = Long
               side = entry_fill.get('side') if entry_fill else exit_fills_group[0].get('side')
-              direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
+              direction = 'Short' if side == 1 else 'Long' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
@@ -282,20 +283,16 @@ jobs:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
                       if direction == 'Long':
-                          # MAE = how far price dropped below entry
                           mae = max(round(entry_price - lowest, 2), 0)
-                          # MFE = how far price rose above entry
                           mfe = max(round(highest - entry_price, 2), 0)
                       else:
-                          # MAE = how far price rose above entry (against short)
                           mae = max(round(highest - entry_price, 2), 0)
-                          # MFE = how far price dropped below entry (in favor of short)
                           mfe = max(round(entry_price - lowest, 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
 
-              # Post-exit MAE/MFE - from exit to 4PM, with padding
+              # Post-exit MAE/MFE - from exit to 4PM with padding
               post_mae, post_mfe = None, None
               if is_eod_run and exit_ts and close_time and exit_ts < close_time:
                   post_bars = fetch_bars(contract_id, exit_ts, close_time, pad=True)
