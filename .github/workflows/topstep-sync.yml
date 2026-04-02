@@ -52,7 +52,6 @@ jobs:
           is_trading_hours = market_open <= est_time_mins < market_close
           is_eod_run = market_close <= est_time_mins <= (market_close + 240)
 
-          # Manual runs always proceed, scheduled runs check time
           if not is_manual and not (is_trading_hours or is_eod_run):
               log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
               sys.exit(0)
@@ -64,7 +63,6 @@ jobs:
           else:
               log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
 
-          # For EOD logic: treat as EOD if past 4PM (even for manual runs after hours)
           is_eod_run = is_eod_run or (is_manual and est_time_mins >= market_close)
 
           BASE = 'https://api.topstepx.com/api'
@@ -225,7 +223,16 @@ jobs:
                   log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
               return []
 
-          # 8. PROCESS TRADES
+          # 8. HELPER: CREATE NOTION PAGE
+          def create_notion_page(properties):
+              payload = {
+                  'parent': {'database_id': NOTION_DATABASE_ID},
+                  'properties': properties
+              }
+              n_res = requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
+              return n_res
+
+          # 9. PROCESS TRADES
           close_hour_utc = 20 if est_offset == -4 else 21
           synced = 0
           updated = 0
@@ -262,56 +269,12 @@ jobs:
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
-              # EOD RUN
-              if is_eod_run:
-                  if not already_exists:
-                      log(f'EOD: SKIPPING {trade_id} - not in Notion yet')
-                      continue
-                  log(f'EOD: UPDATING post-exit for {trade_id}')
-                  post_mae, post_mfe = None, None
-                  if exit_ts and close_time and exit_ts < close_time:
-                      post_bars = fetch_bars(contract_id, exit_ts, close_time)
-                      if post_bars:
-                          if direction == 'Long':
-                              post_mae = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
-                              post_mfe = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
-                          else:
-                              post_mae = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
-                              post_mfe = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
-                          log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
-                      else:
-                          log(f'NO POST-EXIT BARS AVAILABLE')
-                  else:
-                      log(f'NO POST-EXIT WINDOW for {trade_id}')
-
-                  if post_mae is not None and post_mfe is not None:
-                      page_id = existing_trades[trade_id]
-                      update_res = requests.patch(
-                          f'https://api.notion.com/v1/pages/{page_id}',
-                          headers=notion_headers,
-                          json={'properties': {
-                              'Post-Exit MAE': {'number': post_mae},
-                              'Post-Exit MFE': {'number': post_mfe}
-                          }}
-                      )
-                      if update_res.status_code == 200:
-                          log(f'TRADE {trade_id} POST-EXIT UPDATED OK')
-                          updated += 1
-                      else:
-                          log(f'UPDATE FAILED for {trade_id}: {update_res.status_code} - {update_res.text}')
-                  continue
-
-              # REGULAR RUN
-              if already_exists:
-                  log(f'SKIPPING {trade_id} - already in Notion')
-                  skipped += 1
-                  continue
-
+              # Duration
               duration_mins = None
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
-                  log(f'DURATION: {duration_mins} minutes')
 
+              # MAE/MFE during trade
               mae, mfe = None, None
               if entry_ts and exit_ts:
                   bars = fetch_bars(contract_id, entry_ts, exit_ts)
@@ -325,6 +288,21 @@ jobs:
                       log(f'MAE: {mae} | MFE: {mfe}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
+
+              # Post-exit MAE/MFE
+              post_mae, post_mfe = None, None
+              if is_eod_run and exit_ts and close_time and exit_ts < close_time:
+                  post_bars = fetch_bars(contract_id, exit_ts, close_time)
+                  if post_bars:
+                      if direction == 'Long':
+                          post_mae = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
+                          post_mfe = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
+                      else:
+                          post_mae = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
+                          post_mfe = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
+                      log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
+                  else:
+                      log('NO POST-EXIT BARS AVAILABLE')
 
               log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Avg Exit: {avg_exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
 
@@ -347,20 +325,45 @@ jobs:
                   properties['MAE'] = {'number': mae}
               if mfe is not None:
                   properties['MFE'] = {'number': mfe}
+              if post_mae is not None:
+                  properties['Post-Exit MAE'] = {'number': post_mae}
+              if post_mfe is not None:
+                  properties['Post-Exit MFE'] = {'number': post_mfe}
 
-              payload = {
-                  'parent': {'database_id': NOTION_DATABASE_ID},
-                  'properties': properties
-              }
-              n_res = requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
-              if n_res.status_code not in (200, 201):
-                  log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
+              if already_exists:
+                  if is_eod_run:
+                      # Update existing page with post-exit data
+                      page_id = existing_trades[trade_id]
+                      update_props = {}
+                      if post_mae is not None:
+                          update_props['Post-Exit MAE'] = {'number': post_mae}
+                      if post_mfe is not None:
+                          update_props['Post-Exit MFE'] = {'number': post_mfe}
+                      if update_props:
+                          update_res = requests.patch(
+                              f'https://api.notion.com/v1/pages/{page_id}',
+                              headers=notion_headers,
+                              json={'properties': update_props}
+                          )
+                          if update_res.status_code == 200:
+                              log(f'TRADE {trade_id} POST-EXIT UPDATED OK')
+                              updated += 1
+                          else:
+                              log(f'UPDATE FAILED for {trade_id}: {update_res.status_code} - {update_res.text}')
+                  else:
+                      log(f'SKIPPING {trade_id} - already in Notion')
+                      skipped += 1
               else:
-                  log(f'TRADE {trade_id} SYNCED OK')
-                  synced += 1
+                  # Create new page (both during trading hours and EOD)
+                  n_res = create_notion_page(properties)
+                  if n_res.status_code not in (200, 201):
+                      log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
+                  else:
+                      log(f'TRADE {trade_id} SYNCED OK')
+                      synced += 1
 
           if is_eod_run:
-              log(f'FINISHED EOD - {updated} trades updated with Post-Exit data')
+              log(f'FINISHED EOD - {synced} new trades created, {updated} trades updated with Post-Exit data')
           else:
               log(f'FINISHED - {synced} new trades synced, {skipped} already existed')
           EOF
