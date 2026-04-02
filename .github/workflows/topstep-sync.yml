@@ -194,13 +194,10 @@ jobs:
           log(f'GROUPED {len(paired_trades)} TRADES')
 
           # 7. HELPER: FETCH BARS
-          def fetch_bars(contract_id, start, end, pad=False):
-              if pad:
-                  start = start - timedelta(minutes=1)
-                  end = end + timedelta(minutes=1)
+          def fetch_bars(contract_id, start, end, unit=1, unit_number=1):
               start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
               end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
-              log(f'FETCHING BARS: {contract_id} from {start_str} to {end_str}')
+              log(f'FETCHING BARS (unit={unit}): {contract_id} from {start_str} to {end_str}')
               for live in [False, True]:
                   r = requests.post(
                       f'{BASE}/History/retrieveBars',
@@ -210,8 +207,8 @@ jobs:
                           'live': live,
                           'startTime': start_str,
                           'endTime': end_str,
-                          'unit': 2,
-                          'unitNumber': 1,
+                          'unit': unit,
+                          'unitNumber': unit_number,
                           'limit': 500,
                           'includePartialBar': True
                       }
@@ -264,7 +261,6 @@ jobs:
               exit_time = exit_fills_group[-1].get('creationTimestamp')
               exit_ts = parse_ts(exit_time)
 
-              # FIXED: side 1 = sell to open = Short, side 0 = buy to open = Long
               side = entry_fill.get('side') if entry_fill else exit_fills_group[0].get('side')
               direction = 'Short' if side == 1 else 'Long' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
@@ -275,36 +271,40 @@ jobs:
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
 
-              # MAE/MFE - strictly during trade, no padding
+              # MAE/MFE using second-level bars for precision
               mae, mfe = None, None
               if entry_ts and exit_ts:
-                  bars = fetch_bars(contract_id, entry_ts, exit_ts, pad=False)
+                  # Try second bars first, fall back to minute bars
+                  bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=1)
+                  if not bars:
+                      bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
+
                   if bars:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
-                      if direction == 'Long':
-                          mae = max(round(entry_price - lowest, 2), 0)
-                          mfe = max(round(highest - entry_price, 2), 0)
-                      else:
+                      if direction == 'Short':
                           mae = max(round(highest - entry_price, 2), 0)
                           mfe = max(round(entry_price - lowest, 2), 0)
-                      log(f'MAE: {mae} | MFE: {mfe}')
+                      else:
+                          mae = max(round(entry_price - lowest, 2), 0)
+                          mfe = max(round(highest - entry_price, 2), 0)
+                      log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
 
-              # Post-exit MAE/MFE - from exit to 4PM with padding
+              # Post-exit MAE/MFE using minute bars from exit to 4PM
               post_mae, post_mfe = None, None
               if is_eod_run and exit_ts and close_time and exit_ts < close_time:
-                  post_bars = fetch_bars(contract_id, exit_ts, close_time, pad=True)
+                  post_bars = fetch_bars(contract_id, exit_ts, close_time, unit=2, unit_number=1)
                   if post_bars:
                       highest_post = max(b['h'] for b in post_bars)
                       lowest_post = min(b['l'] for b in post_bars)
-                      if direction == 'Long':
-                          post_mae = max(round(avg_exit_price - lowest_post, 2), 0)
-                          post_mfe = max(round(highest_post - avg_exit_price, 2), 0)
-                      else:
+                      if direction == 'Short':
                           post_mae = max(round(highest_post - avg_exit_price, 2), 0)
                           post_mfe = max(round(avg_exit_price - lowest_post, 2), 0)
+                      else:
+                          post_mae = max(round(avg_exit_price - lowest_post, 2), 0)
+                          post_mfe = max(round(highest_post - avg_exit_price, 2), 0)
                       log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
                   else:
                       log('NO POST-EXIT BARS AVAILABLE')
