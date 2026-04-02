@@ -193,12 +193,13 @@ jobs:
 
           log(f'GROUPED {len(paired_trades)} TRADES')
 
-          # 7. HELPER: FETCH 1-MINUTE BARS
-          def fetch_bars(contract_id, start, end):
-              padded_start = start - timedelta(minutes=1)
-              padded_end = end + timedelta(minutes=1)
-              start_str = padded_start.strftime('%Y-%m-%dT%H:%M:%SZ')
-              end_str = padded_end.strftime('%Y-%m-%dT%H:%M:%SZ')
+          # 7. HELPER: FETCH BARS - no padding for trade window, padding only for post-exit
+          def fetch_bars(contract_id, start, end, pad=False):
+              if pad:
+                  start = start - timedelta(minutes=1)
+                  end = end + timedelta(minutes=1)
+              start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+              end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
               log(f'FETCHING BARS: {contract_id} from {start_str} to {end_str}')
               for live in [False, True]:
                   r = requests.post(
@@ -229,8 +230,7 @@ jobs:
                   'parent': {'database_id': NOTION_DATABASE_ID},
                   'properties': properties
               }
-              n_res = requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
-              return n_res
+              return requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
 
           # 9. PROCESS TRADES
           close_hour_utc = 20 if est_offset == -4 else 21
@@ -274,32 +274,40 @@ jobs:
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
 
-              # MAE/MFE during trade
+              # MAE/MFE - strictly during trade, no padding
               mae, mfe = None, None
               if entry_ts and exit_ts:
-                  bars = fetch_bars(contract_id, entry_ts, exit_ts)
+                  bars = fetch_bars(contract_id, entry_ts, exit_ts, pad=False)
                   if bars:
+                      highest = max(b['h'] for b in bars)
+                      lowest = min(b['l'] for b in bars)
                       if direction == 'Long':
-                          mae = max(round(entry_price - min(b['l'] for b in bars), 2), 0)
-                          mfe = max(round(max(b['h'] for b in bars) - entry_price, 2), 0)
+                          # MAE = how far price dropped below entry
+                          mae = max(round(entry_price - lowest, 2), 0)
+                          # MFE = how far price rose above entry
+                          mfe = max(round(highest - entry_price, 2), 0)
                       else:
-                          mae = max(round(max(b['h'] for b in bars) - entry_price, 2), 0)
-                          mfe = max(round(entry_price - min(b['l'] for b in bars), 2), 0)
+                          # MAE = how far price rose above entry (against short)
+                          mae = max(round(highest - entry_price, 2), 0)
+                          # MFE = how far price dropped below entry (in favor of short)
+                          mfe = max(round(entry_price - lowest, 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
 
-              # Post-exit MAE/MFE
+              # Post-exit MAE/MFE - from exit to 4PM, with padding
               post_mae, post_mfe = None, None
               if is_eod_run and exit_ts and close_time and exit_ts < close_time:
-                  post_bars = fetch_bars(contract_id, exit_ts, close_time)
+                  post_bars = fetch_bars(contract_id, exit_ts, close_time, pad=True)
                   if post_bars:
+                      highest_post = max(b['h'] for b in post_bars)
+                      lowest_post = min(b['l'] for b in post_bars)
                       if direction == 'Long':
-                          post_mae = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
-                          post_mfe = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
+                          post_mae = max(round(avg_exit_price - lowest_post, 2), 0)
+                          post_mfe = max(round(highest_post - avg_exit_price, 2), 0)
                       else:
-                          post_mae = max(round(max(b['h'] for b in post_bars) - avg_exit_price, 2), 0)
-                          post_mfe = max(round(avg_exit_price - min(b['l'] for b in post_bars), 2), 0)
+                          post_mae = max(round(highest_post - avg_exit_price, 2), 0)
+                          post_mfe = max(round(avg_exit_price - lowest_post, 2), 0)
                       log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
                   else:
                       log('NO POST-EXIT BARS AVAILABLE')
@@ -332,7 +340,6 @@ jobs:
 
               if already_exists:
                   if is_eod_run:
-                      # Update existing page with post-exit data
                       page_id = existing_trades[trade_id]
                       update_props = {}
                       if post_mae is not None:
@@ -354,7 +361,6 @@ jobs:
                       log(f'SKIPPING {trade_id} - already in Notion')
                       skipped += 1
               else:
-                  # Create new page (both during trading hours and EOD)
                   n_res = create_notion_page(properties)
                   if n_res.status_code not in (200, 201):
                       log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
