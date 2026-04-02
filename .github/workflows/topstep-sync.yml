@@ -229,7 +229,6 @@ jobs:
               direction = 'Long' if side == 1 else 'Short' if side == 0 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # 4PM close time in UTC
               close_time = exit_ts.replace(hour=close_hour_utc, minute=0, second=0, microsecond=0) if exit_ts else None
 
               # EOD RUN - update post-exit data on existing trades
