@@ -29,4 +29,413 @@ jobs:
           NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
           TRIGGERED_BY: ${{ github.event_name }}
           FORCE_EOD: ${{ github.event.inputs.force_eod }}
-        run: python sync.py
+        run: |
+          python - <<'EOF'
+          import os, requests, sys
+          from datetime import datetime, timezone, timedelta
+
+          def log(m): print(f'--- {m}', flush=True)
+
+          def get_est_offset():
+              now_utc = datetime.now(timezone.utc)
+              year = now_utc.year
+              march = datetime(year, 3, 1, tzinfo=timezone.utc)
+              dst_start = march + timedelta(days=(6 - march.weekday()) % 7 + 7)
+              nov = datetime(year, 11, 1, tzinfo=timezone.utc)
+              dst_end = nov + timedelta(days=(6 - nov.weekday()) % 7)
+              if dst_start <= now_utc < dst_end:
+                  return -4
+              return -5
+
+          now_utc = datetime.now(timezone.utc)
+          est_offset = get_est_offset()
+          now_est = now_utc + timedelta(hours=est_offset)
+          est_time_mins = now_est.hour * 60 + now_est.minute
+          market_open = 9 * 60 + 30
+          market_close = 16 * 60
+
+          is_manual = os.environ.get('TRIGGERED_BY') == 'workflow_dispatch'
+          force_eod = os.environ.get('FORCE_EOD', 'false').lower() == 'true'
+          is_trading_hours = market_open <= est_time_mins < market_close
+          is_eod_run = force_eod or market_close <= est_time_mins <= (market_close + 240)
+
+          if not is_manual and not (is_trading_hours or is_eod_run):
+              log(f'OUTSIDE TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - skipping')
+              sys.exit(0)
+
+          if force_eod:
+              log(f'FORCED EOD RUN ({now_est.strftime("%I:%M %p")} EST) - updating Post-Exit MAE/MFE')
+          elif is_eod_run:
+              log(f'EOD RUN ({now_est.strftime("%I:%M %p")} EST) - finalizing Post-Exit MAE/MFE')
+          elif is_manual:
+              log(f'MANUAL RUN ({now_est.strftime("%I:%M %p")} EST) - proceeding regardless of time')
+          else:
+              log(f'WITHIN TRADING HOURS ({now_est.strftime("%I:%M %p")} EST) - starting sync')
+
+          BASE = 'https://api.topstepx.com/api'
+          NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
+          NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID')
+
+          # 1. AUTH
+          log('STARTING AUTH')
+          u = os.environ.get('PROJECTX_USERNAME')
+          k = os.environ.get('PROJECTX_API_KEY')
+          res = requests.post(f'{BASE}/Auth/loginKey', json={'userName': u, 'apiKey': k})
+          if res.status_code != 200:
+              log(f'AUTH FAILED: {res.status_code} - {res.text}')
+              sys.exit(1)
+          token = res.json().get('token')
+          log('AUTH SUCCESS')
+
+          auth_headers = {
+              'Authorization': f'Bearer {token}',
+              'Content-Type': 'application/json',
+              'Accept': 'application/json'
+          }
+
+          # 2. GET ACCOUNT ID
+          log('FETCHING ACCOUNT ID')
+          acc_res = requests.post(f'{BASE}/Account/search', headers=auth_headers, json={'onlyActiveAccounts': True})
+          if acc_res.status_code != 200:
+              log(f'ACCOUNT FETCH FAILED: {acc_res.status_code} - {acc_res.text}')
+              sys.exit(1)
+          acc_raw = acc_res.json()
+          accounts = acc_raw if isinstance(acc_raw, list) else acc_raw.get('accounts') or acc_raw.get('data') or []
+          if not accounts:
+              log('NO ACCOUNTS FOUND')
+              sys.exit(1)
+          account_id = accounts[0].get('id')
+          log(f'USING ACCOUNT ID: {account_id}')
+
+          notion_headers = {
+              'Authorization': f'Bearer {NOTION_TOKEN}',
+              'Notion-Version': '2022-06-28',
+              'Content-Type': 'application/json'
+          }
+
+          # 3. FETCH EXISTING TRADES FROM NOTION
+          log('FETCHING EXISTING NOTION TRADES')
+          existing_trades = {}
+          has_more = True
+          next_cursor = None
+          while has_more:
+              body = {'page_size': 100}
+              if next_cursor:
+                  body['start_cursor'] = next_cursor
+              q_res = requests.post(f'https://api.notion.com/v1/databases/{NOTION_DATABASE_ID}/query', headers=notion_headers, json=body)
+              if q_res.status_code != 200:
+                  log(f'NOTION QUERY FAILED: {q_res.status_code} - {q_res.text}')
+                  sys.exit(1)
+              q_data = q_res.json()
+              for page in q_data.get('results', []):
+                  tid = page.get('properties', {}).get('Trade ID', {}).get('rich_text', [])
+                  if tid:
+                      existing_trades[tid[0]['text']['content']] = page['id']
+              has_more = q_data.get('has_more', False)
+              next_cursor = q_data.get('next_cursor')
+          log(f'FOUND {len(existing_trades)} EXISTING TRADES IN NOTION')
+
+          # 4. FETCH TRADES FROM TOPSTEP
+          log('FETCHING TRADES')
+          start_time = (datetime.now(timezone.utc) - timedelta(hours=48)).strftime('%Y-%m-%dT%H:%M:%SZ')
+          t_res = requests.post(f'{BASE}/Trade/search', headers=auth_headers, json={'accountId': account_id, 'startTime': start_time})
+          if t_res.status_code != 200:
+              log(f'FETCH FAILED: {t_res.status_code} - {t_res.text}')
+              sys.exit(1)
+          raw = t_res.json()
+          trades = raw if isinstance(raw, list) else raw.get('trades') or raw.get('data') or raw.get('items') or []
+          log(f'FOUND {len(trades)} FILLS')
+
+          # 5. PARSE TIMESTAMPS
+          def parse_ts(ts):
+              try:
+                  return datetime.fromisoformat(ts.replace('Z', '+00:00'))
+              except:
+                  return None
+
+          # 6. SEPARATE ENTRIES AND EXITS
+          entry_fills = [t for t in trades if t.get('profitAndLoss') is None]
+          exit_fills_all = [t for t in trades if t.get('profitAndLoss') is not None]
+
+          # Sort all fills by timestamp
+          entry_fills_sorted = sorted(entry_fills, key=lambda x: x.get('creationTimestamp', ''))
+          exit_fills_sorted = sorted(exit_fills_all, key=lambda x: x.get('creationTimestamp', ''))
+
+          # 7. GROUP FILLS INTO COMPLETE TRADES
+          # Strategy: group consecutive entry fills on same contract+side into one trade
+          # then match exits until total size is filled
+          SCALE_IN_WINDOW_SECONDS = 300  # 5 minutes - entries within this window grouped together
+
+          def group_entries(entry_fills_sorted):
+              groups = []  # each group = list of entry fills for one trade
+              used = set()
+              for i, ef in enumerate(entry_fills_sorted):
+                  if ef['id'] in used:
+                      continue
+                  contract = ef.get('contractId')
+                  side = ef.get('side')
+                  ef_ts = parse_ts(ef.get('creationTimestamp', ''))
+                  group = [ef]
+                  used.add(ef['id'])
+                  # Look for more entry fills on same contract+side within window
+                  for j, ef2 in enumerate(entry_fills_sorted):
+                      if ef2['id'] in used:
+                          continue
+                      if ef2.get('contractId') != contract:
+                          continue
+                      if ef2.get('side') != side:
+                          continue
+                      ef2_ts = parse_ts(ef2.get('creationTimestamp', ''))
+                      if ef2_ts and ef_ts:
+                          diff = abs((ef2_ts - ef_ts).total_seconds())
+                          if diff <= SCALE_IN_WINDOW_SECONDS:
+                              group.append(ef2)
+                              used.add(ef2['id'])
+                  groups.append(group)
+              return groups
+
+          entry_groups = group_entries(entry_fills_sorted)
+
+          paired_trades = []
+          used_exit_ids = set()
+
+          for entry_group in entry_groups:
+              entry_group.sort(key=lambda x: x.get('creationTimestamp', ''))
+              contract = entry_group[0].get('contractId')
+              side = entry_group[0].get('side')
+              first_entry_ts = parse_ts(entry_group[0].get('creationTimestamp', ''))
+              total_entry_size = sum(ef.get('size', 1) for ef in entry_group)
+
+              # Find matching exits: same contract, opposite side, after first entry
+              opposite_side = 1 if side == 0 else 0
+              matching_exits = []
+              for ef in exit_fills_sorted:
+                  if ef['id'] in used_exit_ids:
+                      continue
+                  if ef.get('contractId') != contract:
+                      continue
+                  ef_ts = parse_ts(ef.get('creationTimestamp', ''))
+                  if ef_ts and first_entry_ts and ef_ts >= first_entry_ts:
+                      matching_exits.append(ef)
+
+              # Take exits until total size matches
+              grouped_exits = []
+              size_filled = 0
+              for ef in matching_exits:
+                  if size_filled >= total_entry_size:
+                      break
+                  grouped_exits.append(ef)
+                  size_filled += ef.get('size', 1)
+                  used_exit_ids.add(ef['id'])
+
+              if grouped_exits:
+                  paired_trades.append((entry_group, grouped_exits))
+
+          # Handle orphan exits
+          for ef in exit_fills_all:
+              if ef['id'] not in used_exit_ids:
+                  paired_trades.append(([], [ef]))
+
+          log(f'GROUPED {len(paired_trades)} TRADES')
+
+          # 8. HELPER: FETCH BARS
+          def fetch_bars(contract_id, start, end, unit=1, unit_number=30):
+              start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
+              end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
+              log(f'FETCHING BARS (unit={unit} x {unit_number}): {contract_id} from {start_str} to {end_str}')
+              for live in [False, True]:
+                  r = requests.post(
+                      f'{BASE}/History/retrieveBars',
+                      headers=auth_headers,
+                      json={
+                          'contractId': contract_id,
+                          'live': live,
+                          'startTime': start_str,
+                          'endTime': end_str,
+                          'unit': unit,
+                          'unitNumber': unit_number,
+                          'limit': 500,
+                          'includePartialBar': True
+                      }
+                  )
+                  if r.status_code == 200:
+                      bars = r.json().get('bars') or []
+                      if bars:
+                          log(f'GOT {len(bars)} BARS (live={live})')
+                          return bars
+                  log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
+              return []
+
+          # 9. HELPER: CREATE NOTION PAGE
+          def create_notion_page(properties):
+              payload = {
+                  'parent': {'database_id': NOTION_DATABASE_ID},
+                  'properties': properties
+              }
+              return requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
+
+          # 10. PROCESS TRADES
+          close_hour_utc = 20 if est_offset == -4 else 21
+          synced = 0
+          updated = 0
+          skipped = 0
+
+          for entry_group, exit_fills_group in paired_trades:
+              exit_fills_group.sort(key=lambda x: x.get('creationTimestamp', ''))
+
+              # Use first exit fill ID as trade ID
+              trade_id = str(exit_fills_group[0].get('id', 'unknown'))
+              already_exists = trade_id in existing_trades
+
+              # P&L and fees
+              total_pnl = sum(float(ef.get('profitAndLoss', 0) or 0) for ef in exit_fills_group)
+              total_fees = sum(float(ef.get('fees', 0) or 0) for ef in exit_fills_group)
+              for ef in entry_group:
+                  total_fees += float(ef.get('fees', 0) or 0)
+              net_pnl = round(total_pnl - total_fees, 2)
+
+              contract_id = exit_fills_group[0].get('contractId', '')
+              parts = contract_id.split('.')
+              asset = parts[3] if len(parts) >= 4 else contract_id
+
+              # Weighted average exit price
+              total_exit_size = sum(ef.get('size', 1) for ef in exit_fills_group)
+              avg_exit_price = round(
+                  sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in exit_fills_group) / total_exit_size, 2
+              )
+
+              # Weighted average entry price
+              total_entry_size = sum(ef.get('size', 1) for ef in entry_group) if entry_group else total_exit_size
+              if entry_group:
+                  avg_entry_price = round(
+                      sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in entry_group) / total_entry_size, 2
+                  )
+                  entry_time = entry_group[0].get('creationTimestamp')
+                  entry_ts = parse_ts(entry_time)
+              else:
+                  avg_entry_price = 0
+                  entry_time = None
+                  entry_ts = None
+
+              exit_time = exit_fills_group[-1].get('creationTimestamp')
+              exit_ts = parse_ts(exit_time)
+
+              # Direction from first entry fill
+              side = entry_group[0].get('side') if entry_group else exit_fills_group[0].get('side')
+              direction = 'Long' if side == 0 else 'Short' if side == 1 else 'Unknown'
+              net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
+
+              # 4PM close time based on trade date
+              trade_date = exit_ts.date() if exit_ts else None
+              if trade_date:
+                  close_time = datetime(
+                      trade_date.year, trade_date.month, trade_date.day,
+                      close_hour_utc, 0, 0, tzinfo=timezone.utc
+                  )
+              else:
+                  close_time = None
+
+              # Duration from first entry to last exit
+              duration_mins = None
+              if entry_ts and exit_ts:
+                  duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
+
+              # MAE/MFE using 30-second bars
+              mae, mfe = None, None
+              if entry_ts and exit_ts:
+                  bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=30)
+                  if not bars:
+                      bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
+                  if bars:
+                      highest = max(b['h'] for b in bars)
+                      lowest = min(b['l'] for b in bars)
+                      if direction == 'Short':
+                          raw_mae = round(highest - avg_entry_price, 2)
+                          mae = max(min(raw_mae, round(avg_exit_price - avg_entry_price, 2)), 0)
+                          mfe = max(round(avg_entry_price - lowest, 2), 0)
+                      else:
+                          raw_mae = round(avg_entry_price - lowest, 2)
+                          mae = max(min(raw_mae, round(avg_entry_price - avg_exit_price, 2)), 0)
+                          mfe = max(round(highest - avg_entry_price, 2), 0)
+                      log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
+                  else:
+                      log('NO BARS AVAILABLE - MAE/MFE left empty')
+
+              # Post-exit MAE/MFE
+              post_mae, post_mfe = None, None
+              if is_eod_run and exit_ts and close_time and exit_ts < close_time:
+                  post_bars = fetch_bars(contract_id, exit_ts, close_time, unit=2, unit_number=1)
+                  if post_bars:
+                      highest_post = max(b['h'] for b in post_bars)
+                      lowest_post = min(b['l'] for b in post_bars)
+                      if direction == 'Short':
+                          post_mae = max(round(highest_post - avg_exit_price, 2), 0)
+                          post_mfe = max(round(avg_exit_price - lowest_post, 2), 0)
+                      else:
+                          post_mae = max(round(avg_exit_price - lowest_post, 2), 0)
+                          post_mfe = max(round(highest_post - avg_exit_price, 2), 0)
+                      log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
+                  else:
+                      log('NO POST-EXIT BARS AVAILABLE')
+
+              log(f'SYNCING {trade_id} | {asset} | {direction} | Avg Entry: {avg_entry_price} | Avg Exit: {avg_exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
+
+              properties = {
+                  'Note': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
+                  'Trade ID': {'rich_text': [{'text': {'content': trade_id}}]},
+                  'Direction': {'select': {'name': direction}},
+                  'Entry Price': {'number': avg_entry_price},
+                  'Exit Price': {'number': avg_exit_price},
+                  'Exit Time': {'date': {'start': exit_time}},
+                  'P&L': {'number': net_pnl},
+                  'Commissions': {'number': total_fees},
+                  'Contract Size': {'number': float(total_exit_size)},
+              }
+              if entry_time:
+                  properties['Entry Time'] = {'date': {'start': entry_time}}
+              if duration_mins is not None:
+                  properties['Duration'] = {'number': duration_mins}
+              if mae is not None:
+                  properties['MAE'] = {'number': mae}
+              if mfe is not None:
+                  properties['MFE'] = {'number': mfe}
+              if post_mae is not None:
+                  properties['Post-Exit MAE'] = {'number': post_mae}
+              if post_mfe is not None:
+                  properties['Post-Exit MFE'] = {'number': post_mfe}
+
+              if already_exists:
+                  if is_eod_run:
+                      page_id = existing_trades[trade_id]
+                      update_props = {}
+                      if post_mae is not None:
+                          update_props['Post-Exit MAE'] = {'number': post_mae}
+                      if post_mfe is not None:
+                          update_props['Post-Exit MFE'] = {'number': post_mfe}
+                      if update_props:
+                          update_res = requests.patch(
+                              f'https://api.notion.com/v1/pages/{page_id}',
+                              headers=notion_headers,
+                              json={'properties': update_props}
+                          )
+                          if update_res.status_code == 200:
+                              log(f'TRADE {trade_id} POST-EXIT UPDATED OK')
+                              updated += 1
+                          else:
+                              log(f'UPDATE FAILED for {trade_id}: {update_res.status_code} - {update_res.text}')
+                  else:
+                      log(f'SKIPPING {trade_id} - already in Notion')
+                      skipped += 1
+              else:
+                  n_res = create_notion_page(properties)
+                  if n_res.status_code not in (200, 201):
+                      log(f'NOTION FAILED for trade {trade_id}: {n_res.status_code} - {n_res.text}')
+                  else:
+                      log(f'TRADE {trade_id} SYNCED OK')
+                      synced += 1
+
+          if is_eod_run:
+              log(f'FINISHED EOD - {synced} new trades created, {updated} trades updated with Post-Exit data')
+          else:
+              log(f'FINISHED - {synced} new trades synced, {skipped} already existed')
+          EOF
