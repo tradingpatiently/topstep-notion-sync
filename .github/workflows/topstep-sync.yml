@@ -146,62 +146,99 @@ jobs:
           trades = raw if isinstance(raw, list) else raw.get('trades') or raw.get('data') or raw.get('items') or []
           log(f'FOUND {len(trades)} FILLS')
 
-          # 5. SEPARATE ENTRIES AND EXITS
-          # FIX: use 'is None' check so profitAndLoss=0.0 is treated as a closed exit
+          # 5. PARSE TIMESTAMPS
           def parse_ts(ts):
               try:
                   return datetime.fromisoformat(ts.replace('Z', '+00:00'))
               except:
                   return None
 
+          # 6. SEPARATE ENTRIES AND EXITS
           entry_fills = [t for t in trades if t.get('profitAndLoss') is None]
           exit_fills_all = [t for t in trades if t.get('profitAndLoss') is not None]
 
-          # 6. GROUP EXITS INTO COMPLETE TRADES
+          # Sort all fills by timestamp
+          entry_fills_sorted = sorted(entry_fills, key=lambda x: x.get('creationTimestamp', ''))
+          exit_fills_sorted = sorted(exit_fills_all, key=lambda x: x.get('creationTimestamp', ''))
+
+          # 7. GROUP FILLS INTO COMPLETE TRADES
+          # Strategy: group consecutive entry fills on same contract+side into one trade
+          # then match exits until total size is filled
+          SCALE_IN_WINDOW_SECONDS = 300  # 5 minutes - entries within this window grouped together
+
+          def group_entries(entry_fills_sorted):
+              groups = []  # each group = list of entry fills for one trade
+              used = set()
+              for i, ef in enumerate(entry_fills_sorted):
+                  if ef['id'] in used:
+                      continue
+                  contract = ef.get('contractId')
+                  side = ef.get('side')
+                  ef_ts = parse_ts(ef.get('creationTimestamp', ''))
+                  group = [ef]
+                  used.add(ef['id'])
+                  # Look for more entry fills on same contract+side within window
+                  for j, ef2 in enumerate(entry_fills_sorted):
+                      if ef2['id'] in used:
+                          continue
+                      if ef2.get('contractId') != contract:
+                          continue
+                      if ef2.get('side') != side:
+                          continue
+                      ef2_ts = parse_ts(ef2.get('creationTimestamp', ''))
+                      if ef2_ts and ef_ts:
+                          diff = abs((ef2_ts - ef_ts).total_seconds())
+                          if diff <= SCALE_IN_WINDOW_SECONDS:
+                              group.append(ef2)
+                              used.add(ef2['id'])
+                  groups.append(group)
+              return groups
+
+          entry_groups = group_entries(entry_fills_sorted)
+
           paired_trades = []
           used_exit_ids = set()
-          used_entry_ids = set()
 
-          entry_fills_sorted = sorted(entry_fills, key=lambda x: x.get('creationTimestamp', ''))
+          for entry_group in entry_groups:
+              entry_group.sort(key=lambda x: x.get('creationTimestamp', ''))
+              contract = entry_group[0].get('contractId')
+              side = entry_group[0].get('side')
+              first_entry_ts = parse_ts(entry_group[0].get('creationTimestamp', ''))
+              total_entry_size = sum(ef.get('size', 1) for ef in entry_group)
 
-          for entry_fill in entry_fills_sorted:
-              if entry_fill['id'] in used_entry_ids:
-                  continue
-              contract = entry_fill.get('contractId')
-              entry_ts = parse_ts(entry_fill.get('creationTimestamp', ''))
-              entry_size = entry_fill.get('size', 1)
-
+              # Find matching exits: same contract, opposite side, after first entry
+              opposite_side = 1 if side == 0 else 0
               matching_exits = []
-              for exit_fill in exit_fills_all:
-                  if exit_fill['id'] in used_exit_ids:
+              for ef in exit_fills_sorted:
+                  if ef['id'] in used_exit_ids:
                       continue
-                  if exit_fill.get('contractId') != contract:
+                  if ef.get('contractId') != contract:
                       continue
-                  exit_ts = parse_ts(exit_fill.get('creationTimestamp', ''))
-                  if exit_ts and entry_ts and exit_ts >= entry_ts:
-                      matching_exits.append(exit_fill)
+                  ef_ts = parse_ts(ef.get('creationTimestamp', ''))
+                  if ef_ts and first_entry_ts and ef_ts >= first_entry_ts:
+                      matching_exits.append(ef)
 
-              matching_exits.sort(key=lambda x: x.get('creationTimestamp', ''))
+              # Take exits until total size matches
               grouped_exits = []
               size_filled = 0
               for ef in matching_exits:
-                  if size_filled >= entry_size:
+                  if size_filled >= total_entry_size:
                       break
                   grouped_exits.append(ef)
                   size_filled += ef.get('size', 1)
                   used_exit_ids.add(ef['id'])
 
               if grouped_exits:
-                  used_entry_ids.add(entry_fill['id'])
-                  paired_trades.append((entry_fill, grouped_exits))
+                  paired_trades.append((entry_group, grouped_exits))
 
-          for exit_fill in exit_fills_all:
-              if exit_fill['id'] not in used_exit_ids:
-                  paired_trades.append((None, [exit_fill]))
+          # Handle orphan exits
+          for ef in exit_fills_all:
+              if ef['id'] not in used_exit_ids:
+                  paired_trades.append(([], [ef]))
 
           log(f'GROUPED {len(paired_trades)} TRADES')
 
-          # 7. HELPER: FETCH BARS
+          # 8. HELPER: FETCH BARS
           def fetch_bars(contract_id, start, end, unit=1, unit_number=30):
               start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
               end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
@@ -229,7 +266,7 @@ jobs:
                   log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
               return []
 
-          # 8. HELPER: CREATE NOTION PAGE
+          # 9. HELPER: CREATE NOTION PAGE
           def create_notion_page(properties):
               payload = {
                   'parent': {'database_id': NOTION_DATABASE_ID},
@@ -237,44 +274,58 @@ jobs:
               }
               return requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
 
-          # 9. PROCESS TRADES
+          # 10. PROCESS TRADES
           close_hour_utc = 20 if est_offset == -4 else 21
           synced = 0
           updated = 0
           skipped = 0
 
-          for entry_fill, exit_fills_group in paired_trades:
+          for entry_group, exit_fills_group in paired_trades:
               exit_fills_group.sort(key=lambda x: x.get('creationTimestamp', ''))
+
+              # Use first exit fill ID as trade ID
               trade_id = str(exit_fills_group[0].get('id', 'unknown'))
               already_exists = trade_id in existing_trades
 
+              # P&L and fees
               total_pnl = sum(float(ef.get('profitAndLoss', 0) or 0) for ef in exit_fills_group)
               total_fees = sum(float(ef.get('fees', 0) or 0) for ef in exit_fills_group)
-              if entry_fill:
-                  total_fees += float(entry_fill.get('fees', 0) or 0)
+              for ef in entry_group:
+                  total_fees += float(ef.get('fees', 0) or 0)
               net_pnl = round(total_pnl - total_fees, 2)
 
               contract_id = exit_fills_group[0].get('contractId', '')
               parts = contract_id.split('.')
               asset = parts[3] if len(parts) >= 4 else contract_id
 
-              total_size = sum(ef.get('size', 1) for ef in exit_fills_group)
+              # Weighted average exit price
+              total_exit_size = sum(ef.get('size', 1) for ef in exit_fills_group)
               avg_exit_price = round(
-                  sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in exit_fills_group) / total_size, 2
+                  sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in exit_fills_group) / total_exit_size, 2
               )
 
-              entry_time = entry_fill.get('creationTimestamp') if entry_fill else None
-              entry_ts = parse_ts(entry_time) if entry_time else None
-              entry_price = float(entry_fill.get('price', 0) or 0) if entry_fill else 0
+              # Weighted average entry price
+              total_entry_size = sum(ef.get('size', 1) for ef in entry_group) if entry_group else total_exit_size
+              if entry_group:
+                  avg_entry_price = round(
+                      sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in entry_group) / total_entry_size, 2
+                  )
+                  entry_time = entry_group[0].get('creationTimestamp')
+                  entry_ts = parse_ts(entry_time)
+              else:
+                  avg_entry_price = 0
+                  entry_time = None
+                  entry_ts = None
+
               exit_time = exit_fills_group[-1].get('creationTimestamp')
               exit_ts = parse_ts(exit_time)
 
-              # Direction based on entry fill side: 0 = buy to open = Long, 1 = sell to open = Short
-              side = entry_fill.get('side') if entry_fill else exit_fills_group[0].get('side')
+              # Direction from first entry fill
+              side = entry_group[0].get('side') if entry_group else exit_fills_group[0].get('side')
               direction = 'Long' if side == 0 else 'Short' if side == 1 else 'Unknown'
               net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
 
-              # For EOD: use the trade's actual date for 4PM close time
+              # 4PM close time based on trade date
               trade_date = exit_ts.date() if exit_ts else None
               if trade_date:
                   close_time = datetime(
@@ -284,7 +335,7 @@ jobs:
               else:
                   close_time = None
 
-              # Duration
+              # Duration from first entry to last exit
               duration_mins = None
               if entry_ts and exit_ts:
                   duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
@@ -299,18 +350,18 @@ jobs:
                       highest = max(b['h'] for b in bars)
                       lowest = min(b['l'] for b in bars)
                       if direction == 'Short':
-                          raw_mae = round(highest - entry_price, 2)
-                          mae = max(min(raw_mae, round(avg_exit_price - entry_price, 2)), 0)
-                          mfe = max(round(entry_price - lowest, 2), 0)
+                          raw_mae = round(highest - avg_entry_price, 2)
+                          mae = max(min(raw_mae, round(avg_exit_price - avg_entry_price, 2)), 0)
+                          mfe = max(round(avg_entry_price - lowest, 2), 0)
                       else:
-                          raw_mae = round(entry_price - lowest, 2)
-                          mae = max(min(raw_mae, round(entry_price - avg_exit_price, 2)), 0)
-                          mfe = max(round(highest - entry_price, 2), 0)
+                          raw_mae = round(avg_entry_price - lowest, 2)
+                          mae = max(min(raw_mae, round(avg_entry_price - avg_exit_price, 2)), 0)
+                          mfe = max(round(highest - avg_entry_price, 2), 0)
                       log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
                   else:
                       log('NO BARS AVAILABLE - MAE/MFE left empty')
 
-              # Post-exit MAE/MFE using 1-minute bars from exit to 4PM
+              # Post-exit MAE/MFE
               post_mae, post_mfe = None, None
               if is_eod_run and exit_ts and close_time and exit_ts < close_time:
                   post_bars = fetch_bars(contract_id, exit_ts, close_time, unit=2, unit_number=1)
@@ -327,18 +378,18 @@ jobs:
                   else:
                       log('NO POST-EXIT BARS AVAILABLE')
 
-              log(f'SYNCING {trade_id} | {asset} | {direction} | Entry: {entry_price} | Avg Exit: {avg_exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
+              log(f'SYNCING {trade_id} | {asset} | {direction} | Avg Entry: {avg_entry_price} | Avg Exit: {avg_exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
 
               properties = {
                   'Note': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
                   'Trade ID': {'rich_text': [{'text': {'content': trade_id}}]},
                   'Direction': {'select': {'name': direction}},
-                  'Entry Price': {'number': entry_price},
+                  'Entry Price': {'number': avg_entry_price},
                   'Exit Price': {'number': avg_exit_price},
                   'Exit Time': {'date': {'start': exit_time}},
                   'P&L': {'number': net_pnl},
                   'Commissions': {'number': total_fees},
-                  'Contract Size': {'number': float(total_size)},
+                  'Contract Size': {'number': float(total_exit_size)},
               }
               if entry_time:
                   properties['Entry Time'] = {'date': {'start': entry_time}}
