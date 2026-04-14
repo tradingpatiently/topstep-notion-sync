@@ -21,16 +21,9 @@ jobs:
           python-version: '3.9'
       - name: Install Requests
         run: pip install requests
-      - name: Run Sync
-        env:
-          PROJECTX_USERNAME: ${{ secrets.PROJECTX_USERNAME }}
-          PROJECTX_API_KEY: ${{ secrets.PROJECTX_API_KEY }}
-          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
-          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
-          TRIGGERED_BY: ${{ github.event_name }}
-          FORCE_EOD: ${{ github.event.inputs.force_eod }}
+      - name: Write sync script
         run: |
-          python - <<'EOF'
+          cat > sync.py << 'PYEOF'
           import os, requests, sys
           from datetime import datetime, timezone, timedelta
 
@@ -75,18 +68,6 @@ jobs:
           BASE = 'https://api.topstepx.com/api'
           NOTION_TOKEN = os.environ.get('NOTION_TOKEN')
           NOTION_DATABASE_ID = os.environ.get('NOTION_DATABASE_ID')
-
-          # LOAD BLOCKLIST
-          blocklist = set()
-          try:
-              with open('blocklist.txt', 'r') as f:
-                  for line in f:
-                      tid = line.strip()
-                      if tid:
-                          blocklist.add(tid)
-              log(f'BLOCKLIST LOADED: {len(blocklist)} trades blocked')
-          except FileNotFoundError:
-              log('NO BLOCKLIST FILE FOUND - skipping')
 
           # 1. AUTH
           log('STARTING AUTH')
@@ -172,13 +153,13 @@ jobs:
           entry_fills_sorted = sorted(entry_fills, key=lambda x: x.get('creationTimestamp', ''))
           exit_fills_sorted = sorted(exit_fills_all, key=lambda x: x.get('creationTimestamp', ''))
 
-          # 7. GROUP FILLS INTO COMPLETE TRADES
-          SCALE_IN_WINDOW_SECONDS = 300  # 5 minutes
+          # 7. GROUP SCALE-IN ENTRIES
+          SCALE_IN_WINDOW_SECONDS = 300
 
           def group_entries(entry_fills_sorted):
               groups = []
               used = set()
-              for i, ef in enumerate(entry_fills_sorted):
+              for ef in entry_fills_sorted:
                   if ef['id'] in used:
                       continue
                   contract = ef.get('contractId')
@@ -186,7 +167,7 @@ jobs:
                   ef_ts = parse_ts(ef.get('creationTimestamp', ''))
                   group = [ef]
                   used.add(ef['id'])
-                  for j, ef2 in enumerate(entry_fills_sorted):
+                  for ef2 in entry_fills_sorted:
                       if ef2['id'] in used:
                           continue
                       if ef2.get('contractId') != contract:
@@ -242,153 +223,8 @@ jobs:
 
           log(f'GROUPED {len(paired_trades)} TRADES')
 
-          # 8. HELPER: FETCH BARS
+          # 8. FETCH BARS
           def fetch_bars(contract_id, start, end, unit=1, unit_number=30):
               start_str = start.strftime('%Y-%m-%dT%H:%M:%SZ')
               end_str = end.strftime('%Y-%m-%dT%H:%M:%SZ')
-              log(f'FETCHING BARS (unit={unit} x {unit_number}): {contract_id} from {start_str} to {end_str}')
-              for live in [False, True]:
-                  r = requests.post(
-                      f'{BASE}/History/retrieveBars',
-                      headers=auth_headers,
-                      json={
-                          'contractId': contract_id,
-                          'live': live,
-                          'startTime': start_str,
-                          'endTime': end_str,
-                          'unit': unit,
-                          'unitNumber': unit_number,
-                          'limit': 500,
-                          'includePartialBar': True
-                      }
-                  )
-                  if r.status_code == 200:
-                      bars = r.json().get('bars') or []
-                      if bars:
-                          log(f'GOT {len(bars)} BARS (live={live})')
-                          return bars
-                  log(f'NO BARS (live={live}): {r.status_code} - {r.text[:150]}')
-              return []
-
-          # 9. HELPER: CREATE NOTION PAGE
-          def create_notion_page(properties):
-              payload = {
-                  'parent': {'database_id': NOTION_DATABASE_ID},
-                  'properties': properties
-              }
-              return requests.post('https://api.notion.com/v1/pages', headers=notion_headers, json=payload)
-
-          # 10. PROCESS TRADES
-          close_hour_utc = 20 if est_offset == -4 else 21
-          synced = 0
-          updated = 0
-          skipped = 0
-          blocked = 0
-
-          for entry_group, exit_fills_group in paired_trades:
-              exit_fills_group.sort(key=lambda x: x.get('creationTimestamp', ''))
-              trade_id = str(exit_fills_group[0].get('id', 'unknown'))
-
-              # CHECK BLOCKLIST
-              if trade_id in blocklist:
-                  log(f'BLOCKED {trade_id} - in blocklist, skipping')
-                  blocked += 1
-                  continue
-
-              # Also block if any fill ID in the group is in blocklist
-              all_fill_ids = [str(ef['id']) for ef in exit_fills_group] + [str(ef['id']) for ef in entry_group]
-              if any(fid in blocklist for fid in all_fill_ids):
-                  log(f'BLOCKED {trade_id} - a fill in this trade is in blocklist, skipping')
-                  blocked += 1
-                  continue
-
-              already_exists = trade_id in existing_trades
-
-              total_pnl = sum(float(ef.get('profitAndLoss', 0) or 0) for ef in exit_fills_group)
-              total_fees = sum(float(ef.get('fees', 0) or 0) for ef in exit_fills_group)
-              for ef in entry_group:
-                  total_fees += float(ef.get('fees', 0) or 0)
-              net_pnl = round(total_pnl - total_fees, 2)
-
-              contract_id = exit_fills_group[0].get('contractId', '')
-              parts = contract_id.split('.')
-              asset = parts[3] if len(parts) >= 4 else contract_id
-
-              total_exit_size = sum(ef.get('size', 1) for ef in exit_fills_group)
-              avg_exit_price = round(
-                  sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in exit_fills_group) / total_exit_size, 2
-              )
-
-              total_entry_size = sum(ef.get('size', 1) for ef in entry_group) if entry_group else total_exit_size
-              if entry_group:
-                  avg_entry_price = round(
-                      sum(float(ef.get('price', 0)) * ef.get('size', 1) for ef in entry_group) / total_entry_size, 2
-                  )
-                  entry_time = entry_group[0].get('creationTimestamp')
-                  entry_ts = parse_ts(entry_time)
-              else:
-                  avg_entry_price = 0
-                  entry_time = None
-                  entry_ts = None
-
-              exit_time = exit_fills_group[-1].get('creationTimestamp')
-              exit_ts = parse_ts(exit_time)
-
-              side = entry_group[0].get('side') if entry_group else exit_fills_group[0].get('side')
-              direction = 'Long' if side == 0 else 'Short' if side == 1 else 'Unknown'
-              net_pnl_display = f"+${net_pnl}" if net_pnl >= 0 else f"-${abs(net_pnl)}"
-
-              trade_date = exit_ts.date() if exit_ts else None
-              if trade_date:
-                  close_time = datetime(
-                      trade_date.year, trade_date.month, trade_date.day,
-                      close_hour_utc, 0, 0, tzinfo=timezone.utc
-                  )
-              else:
-                  close_time = None
-
-              duration_mins = None
-              if entry_ts and exit_ts:
-                  duration_mins = round((exit_ts - entry_ts).total_seconds() / 60, 2)
-
-              mae, mfe = None, None
-              if entry_ts and exit_ts:
-                  bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=1, unit_number=30)
-                  if not bars:
-                      bars = fetch_bars(contract_id, entry_ts, exit_ts, unit=2, unit_number=1)
-                  if bars:
-                      highest = max(b['h'] for b in bars)
-                      lowest = min(b['l'] for b in bars)
-                      if direction == 'Short':
-                          raw_mae = round(highest - avg_entry_price, 2)
-                          mae = max(min(raw_mae, round(avg_exit_price - avg_entry_price, 2)), 0)
-                          mfe = max(round(avg_entry_price - lowest, 2), 0)
-                      else:
-                          raw_mae = round(avg_entry_price - lowest, 2)
-                          mae = max(min(raw_mae, round(avg_entry_price - avg_exit_price, 2)), 0)
-                          mfe = max(round(highest - avg_entry_price, 2), 0)
-                      log(f'MAE: {mae} | MFE: {mfe} | Highest: {highest} | Lowest: {lowest}')
-                  else:
-                      log('NO BARS AVAILABLE - MAE/MFE left empty')
-
-              post_mae, post_mfe = None, None
-              if is_eod_run and exit_ts and close_time and exit_ts < close_time:
-                  post_bars = fetch_bars(contract_id, exit_ts, close_time, unit=2, unit_number=1)
-                  if post_bars:
-                      highest_post = max(b['h'] for b in post_bars)
-                      lowest_post = min(b['l'] for b in post_bars)
-                      if direction == 'Short':
-                          post_mae = max(round(highest_post - avg_exit_price, 2), 0)
-                          post_mfe = max(round(avg_exit_price - lowest_post, 2), 0)
-                      else:
-                          post_mae = max(round(avg_exit_price - lowest_post, 2), 0)
-                          post_mfe = max(round(highest_post - avg_exit_price, 2), 0)
-                      log(f'Post-Exit MAE: {post_mae} | Post-Exit MFE: {post_mfe}')
-                  else:
-                      log('NO POST-EXIT BARS AVAILABLE')
-
-              log(f'SYNCING {trade_id} | {asset} | {direction} | Avg Entry: {avg_entry_price} | Avg Exit: {avg_exit_price} | P&L: {net_pnl_display} | Duration: {duration_mins}m')
-
-              properties = {
-                  'Note': {'title': [{'text': {'content': f'{asset} {direction} | {net_pnl_display}'}}]},
-                  'Trade ID': {'rich_text': [{'text': {'content': trade_id}}]},
+              log(f'FETCHING BARS (unit={unit} x {unit_number}): {contract_id} from {start_str}
